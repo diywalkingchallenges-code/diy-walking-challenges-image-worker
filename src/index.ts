@@ -1,0 +1,728 @@
+import { ImageValidationError, sha256Hex, validateGeneratedImage, validateReferenceImage } from "./images";
+import {
+  enabledModelSpecs,
+  findEnabledModel,
+  findModelAssetSpec,
+  MODEL_REFERENCE_MAX_EDGE,
+  runImageModel,
+} from "./models";
+import {
+  buildAssetPrompt,
+  countCodePoints,
+  DEFAULT_ASSET_KIND,
+  isAssetKind,
+  MAX_USER_PROMPT_CODE_POINTS,
+  MIN_USER_PROMPT_CODE_POINTS,
+  sanitizeUserPrompt,
+} from "./prompt";
+import {
+  MODEL_DAILY_ATTEMPT_LIMIT,
+  parsePositiveLimit,
+  reserveGenerationBudget,
+  secondsUntilNextUtcDay,
+} from "./quota";
+import { createReportToken, parseReport, saveReport, verifyReportToken } from "./reports";
+import {
+  assertPromptSafe,
+  DEFAULT_SAFETY_MODEL,
+  estimateSafetyNeurons,
+  SafetyServiceError,
+  UnsafePromptError,
+} from "./safety";
+import type { Env, ParsedGenerationRequest, ReferenceImage } from "./types";
+
+const API_VERSION = 1;
+const MAX_GENERATE_BODY_BYTES = 3 * 1024 * 1024;
+const MAX_REPORT_BODY_BYTES = 8 * 1024;
+const MAX_REFERENCE_BYTES = 2 * 1024 * 1024;
+const MAX_REFERENCE_BASE64_CHARACTERS = Math.ceil(MAX_REFERENCE_BYTES / 3) * 4 + 4;
+const INSTALLATION_ID_PATTERN = /^[A-Za-z0-9._-]{20,80}$/u;
+
+type ErrorCode =
+  | "content_rejected"
+  | "daily_quota_exhausted"
+  | "invalid_prompt"
+  | "invalid_report_token"
+  | "invalid_request"
+  | "method_not_allowed"
+  | "model_daily_limit_reached"
+  | "model_unavailable"
+  | "not_found"
+  | "origin_not_allowed"
+  | "rate_limited"
+  | "service_unavailable";
+
+class ApiError extends Error {
+  constructor(
+    readonly status: number,
+    readonly code: ErrorCode,
+    message: string,
+    readonly retryable = false,
+    readonly retryAfterSeconds?: number,
+  ) {
+    super(message);
+  }
+}
+
+function securityHeaders(): Headers {
+  return new Headers({
+    "Cache-Control": "no-store",
+    "Referrer-Policy": "no-referrer",
+    "X-Content-Type-Options": "nosniff",
+    "X-Frame-Options": "DENY",
+    "X-DIYWC-API-Version": String(API_VERSION),
+  });
+}
+
+function parseAllowedOrigins(config: string | undefined): Set<string> {
+  return new Set(
+    (config ?? "")
+      .split(",")
+      .map((value) => value.trim())
+      .filter((value) => value && value !== "*"),
+  );
+}
+
+function acceptedCorsOrigin(request: Request, env: Env): string | undefined {
+  const origin = request.headers.get("Origin");
+  if (!origin) return undefined;
+  if (!parseAllowedOrigins(env.ALLOWED_ORIGINS).has(origin)) {
+    throw new ApiError(403, "origin_not_allowed", "This browser origin is not allowed");
+  }
+  return origin;
+}
+
+function addCorsHeaders(headers: Headers, origin: string | undefined): void {
+  if (!origin) return;
+  headers.set("Access-Control-Allow-Origin", origin);
+  headers.set("Access-Control-Allow-Methods", "GET,POST,OPTIONS");
+  headers.set(
+    "Access-Control-Allow-Headers",
+    "Content-Type,X-DIYWC-Installation-ID",
+  );
+  headers.set(
+    "Access-Control-Expose-Headers",
+    [
+      "Content-Length",
+      "Retry-After",
+      "X-DIYWC-Estimated-Neurons",
+      "X-DIYWC-Asset-Kind",
+      "X-DIYWC-Global-Estimated-Neurons-Remaining",
+      "X-DIYWC-Global-Estimated-Neurons-Used",
+      "X-DIYWC-Height",
+      "X-DIYWC-Model",
+      "X-DIYWC-Model-Attempts-Remaining",
+      "X-DIYWC-Model-Attempts-Used",
+      "X-DIYWC-Report-Token",
+      "X-DIYWC-Request-ID",
+      "X-DIYWC-SHA256",
+      "X-DIYWC-Width",
+    ].join(","),
+  );
+  headers.append("Vary", "Origin");
+}
+
+function jsonResponse(
+  value: unknown,
+  status: number,
+  origin: string | undefined,
+  extraHeaders?: HeadersInit,
+): Response {
+  const headers = securityHeaders();
+  headers.set("Content-Type", "application/json; charset=utf-8");
+  if (extraHeaders) new Headers(extraHeaders).forEach((value, key) => headers.set(key, value));
+  addCorsHeaders(headers, origin);
+  return new Response(JSON.stringify(value), { status, headers });
+}
+
+const LANDING_PAGE_HTML = `<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="robots" content="noindex,nofollow,noarchive">
+  <title>DIY Walking Challenges · Artwork Generator</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; }
+    * { box-sizing: border-box; }
+    body { margin: 0; min-height: 100vh; display: grid; place-items: center; padding: 24px; color: #f8f4e7;
+      background: radial-gradient(circle at top, #244b37 0, #101914 44%, #090d0b 100%); }
+    main { width: min(620px, 100%); padding: clamp(28px, 7vw, 54px); text-align: center; border: 1px solid #6d765f;
+      border-radius: 28px; background: rgba(17, 27, 22, .94); box-shadow: 0 28px 80px #0009, inset 0 0 0 1px #dcb45c22; }
+    .mark { width: 76px; height: 76px; margin: 0 auto 24px; display: grid; place-items: center; border-radius: 24px;
+      color: #1b241d; background: linear-gradient(145deg, #f2ca72, #b98535); font-size: 38px; box-shadow: 0 12px 36px #0008; }
+    .eyebrow { margin: 0 0 10px; color: #edc46c; font-weight: 800; letter-spacing: .12em; text-transform: uppercase; font-size: .78rem; }
+    h1 { margin: 0; font-size: clamp(2rem, 7vw, 3.6rem); line-height: 1.02; }
+    .status { display: inline-flex; align-items: center; gap: 9px; margin: 26px 0 18px; padding: 9px 15px; border-radius: 999px;
+      color: #d9f6df; background: #1d3d2b; font-weight: 750; }
+    .dot { width: 10px; height: 10px; border-radius: 50%; background: #70db8d; box-shadow: 0 0 14px #70db8d; }
+    p { color: #cbd2cb; line-height: 1.65; }
+  </style>
+</head>
+<body>
+  <main>
+    <div class="mark" aria-hidden="true">✦</div>
+    <p class="eyebrow">DIY Walking Challenges</p>
+    <h1>Artwork generator is online</h1>
+    <div class="status"><span class="dot" aria-hidden="true"></span>Service online · API v${API_VERSION}</div>
+    <p>This service powers optional AI artwork for completion medals, milestone banners, and route maps in the DIY Walking Challenges Android app. You do not need to configure anything on this page.</p>
+  </main>
+</body>
+</html>`;
+
+function landingPageResponse(method: string, origin: string | undefined): Response {
+  const headers = securityHeaders();
+  headers.set("Content-Type", "text/html; charset=utf-8");
+  headers.set(
+    "Content-Security-Policy",
+    "default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'; frame-ancestors 'none'",
+  );
+  headers.set("Permissions-Policy", "camera=(), geolocation=(), microphone=()");
+  addCorsHeaders(headers, origin);
+  return new Response(method === "HEAD" ? null : LANDING_PAGE_HTML, { status: 200, headers });
+}
+
+function redirectToCanonicalModels(url: URL, origin: string | undefined): Response {
+  const headers = securityHeaders();
+  headers.set("Location", new URL("/v1/models", url).toString());
+  addCorsHeaders(headers, origin);
+  return new Response(null, { status: 308, headers });
+}
+
+function errorResponse(error: ApiError, requestId: string, origin: string | undefined): Response {
+  const extra = new Headers();
+  if (error.retryAfterSeconds !== undefined) {
+    extra.set("Retry-After", String(error.retryAfterSeconds));
+  }
+  return jsonResponse(
+    {
+      error: {
+        code: error.code,
+        message: error.message,
+        retryable: error.retryable,
+        requestId,
+        ...(error.retryAfterSeconds === undefined
+          ? {}
+          : { retryAfterSeconds: error.retryAfterSeconds }),
+      },
+    },
+    error.status,
+    origin,
+    extra,
+  );
+}
+
+function requireSecret(value: string | undefined): string {
+  if (!value || value.length < 32) {
+    throw new ApiError(
+      503,
+      "service_unavailable",
+      "Image generation is not configured. You can still upload your own artwork.",
+      true,
+    );
+  }
+  return value;
+}
+
+function requireInstallationId(request: Request): string {
+  const value = request.headers.get("X-DIYWC-Installation-ID") ?? "";
+  if (!INSTALLATION_ID_PATTERN.test(value)) {
+    throw new ApiError(400, "invalid_request", "A valid app installation ID is required");
+  }
+  return value;
+}
+
+async function hashRateLimitKey(kind: string, value: string, pepper: string): Promise<string> {
+  const digest = await crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(`${pepper}\n${kind}\n${value}`),
+  );
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("");
+}
+
+async function readJsonBody(request: Request, maximumBytes: number): Promise<unknown> {
+  const contentType = request.headers.get("Content-Type")?.split(";", 1)[0].trim().toLowerCase();
+  if (contentType !== "application/json") {
+    throw new ApiError(415, "invalid_request", "Content-Type must be application/json");
+  }
+  const declaredLength = Number(request.headers.get("Content-Length"));
+  if (Number.isFinite(declaredLength) && declaredLength > maximumBytes) {
+    throw new ApiError(413, "invalid_request", "Request body is too large");
+  }
+  const body = await request.arrayBuffer();
+  if (body.byteLength === 0 || body.byteLength > maximumBytes) {
+    throw new ApiError(413, "invalid_request", "Request body is empty or too large");
+  }
+  try {
+    const text = new TextDecoder("utf-8", { fatal: true }).decode(body);
+    return JSON.parse(text) as unknown;
+  } catch {
+    throw new ApiError(400, "invalid_request", "Request body is not valid JSON");
+  }
+}
+
+function decodeReference(value: unknown): ReferenceImage {
+  if (typeof value !== "object" || value === null) {
+    throw new ApiError(400, "invalid_request", "Reference image must be an object");
+  }
+  const reference = value as Record<string, unknown>;
+  if (reference.rightsConfirmed !== true) {
+    throw new ApiError(
+      400,
+      "invalid_request",
+      "Confirm that you own or have permission to use the reference image",
+    );
+  }
+  const mimeType = reference.mimeType;
+  if (mimeType !== "image/jpeg" && mimeType !== "image/png" && mimeType !== "image/webp") {
+    throw new ApiError(400, "invalid_request", "Reference image must be JPEG, PNG, or WebP");
+  }
+  if (
+    typeof reference.dataBase64 !== "string" ||
+    reference.dataBase64.length === 0 ||
+    reference.dataBase64.length > MAX_REFERENCE_BASE64_CHARACTERS ||
+    !/^[A-Za-z0-9+/]*={0,2}$/u.test(reference.dataBase64)
+  ) {
+    throw new ApiError(400, "invalid_request", "Reference image data is invalid or too large");
+  }
+  let binary: string;
+  try {
+    binary = atob(reference.dataBase64);
+  } catch {
+    throw new ApiError(400, "invalid_request", "Reference image is not valid Base64 data");
+  }
+  if (binary.length === 0 || binary.length > MAX_REFERENCE_BYTES) {
+    throw new ApiError(400, "invalid_request", "Reference image must be no larger than 2 MiB");
+  }
+  const bytes = Uint8Array.from(binary, (character) => character.charCodeAt(0));
+  let image;
+  try {
+    image = validateReferenceImage(bytes, mimeType);
+  } catch (error) {
+    if (error instanceof ImageValidationError) {
+      throw new ApiError(400, "invalid_request", error.message);
+    }
+    throw error;
+  }
+  return { mimeType, bytes, width: image.width, height: image.height };
+}
+
+function parseGenerationRequest(body: unknown, enabledConfig: string | undefined): ParsedGenerationRequest {
+  if (typeof body !== "object" || body === null) {
+    throw new ApiError(400, "invalid_request", "Request body must be an object");
+  }
+  const value = body as Record<string, unknown>;
+  const assetKindValue = value.assetKind ?? DEFAULT_ASSET_KIND;
+  if (!isAssetKind(assetKindValue)) {
+    throw new ApiError(400, "invalid_request", "That artwork type is not available");
+  }
+  const model = typeof value.model === "string"
+    ? findEnabledModel(value.model, enabledConfig)
+    : undefined;
+  if (!model) {
+    throw new ApiError(400, "model_unavailable", "That image model is not available");
+  }
+  if (!findModelAssetSpec(model, assetKindValue)) {
+    throw new ApiError(
+      400,
+      "model_unavailable",
+      "That image model is not available for the selected artwork type",
+    );
+  }
+  if (typeof value.prompt !== "string") {
+    throw new ApiError(400, "invalid_prompt", "Describe the artwork you want to create");
+  }
+  const userPrompt = sanitizeUserPrompt(value.prompt);
+  const length = countCodePoints(userPrompt);
+  if (length < MIN_USER_PROMPT_CODE_POINTS || length > MAX_USER_PROMPT_CODE_POINTS) {
+    throw new ApiError(
+      400,
+      "invalid_prompt",
+      `Artwork theme must be between ${MIN_USER_PROMPT_CODE_POINTS} and ${MAX_USER_PROMPT_CODE_POINTS} characters`,
+    );
+  }
+  let seed: number | undefined;
+  if (value.seed !== undefined) {
+    if (!Number.isSafeInteger(value.seed) || Number(value.seed) < 0 || Number(value.seed) > 2_147_483_647) {
+      throw new ApiError(400, "invalid_request", "Seed must be a positive 32-bit integer");
+    }
+    seed = Number(value.seed);
+  }
+  const reference = value.reference === undefined ? undefined : decodeReference(value.reference);
+  if (reference && !model.supportsReference) {
+    throw new ApiError(400, "invalid_request", "The selected model does not support reference images");
+  }
+  if (
+    reference &&
+    (reference.width > MODEL_REFERENCE_MAX_EDGE || reference.height > MODEL_REFERENCE_MAX_EDGE)
+  ) {
+    throw new ApiError(
+      400,
+      "invalid_request",
+      `Reference image dimensions must be no larger than ${MODEL_REFERENCE_MAX_EDGE} by ${MODEL_REFERENCE_MAX_EDGE} pixels`,
+    );
+  }
+  return {
+    assetKind: assetKindValue,
+    model: value.model as string,
+    userPrompt,
+    ...(seed === undefined ? {} : { seed }),
+    ...(reference ? { reference } : {}),
+  };
+}
+
+async function applyGenerationBurstLimits(
+  request: Request,
+  env: Env,
+  installationId: string,
+  pepper: string,
+): Promise<string> {
+  const ip = request.headers.get("CF-Connecting-IP");
+  if (!ip) throw new ApiError(400, "invalid_request", "Client network information is unavailable");
+  const [installationHash, ipHash] = await Promise.all([
+    hashRateLimitKey("installation", installationId, pepper),
+    hashRateLimitKey("ip", ip, pepper),
+  ]);
+  let limits: [{ success: boolean }, { success: boolean }];
+  try {
+    limits = await Promise.all([
+      env.INSTALL_RATE_LIMITER.limit({ key: installationHash }),
+      env.IP_RATE_LIMITER.limit({ key: ipHash }),
+    ]);
+  } catch {
+    throw new ApiError(
+      503,
+      "service_unavailable",
+      "Image generation is temporarily unavailable. You can still upload your own artwork.",
+      true,
+      60,
+    );
+  }
+  if (!limits[0].success || !limits[1].success) {
+    throw new ApiError(429, "rate_limited", "Please wait a minute before generating another image", true, 60);
+  }
+  return installationHash;
+}
+
+function classifyModelError(error: unknown): ApiError {
+  const message = error instanceof Error ? error.message : String(error);
+  if (/safety|moderation|inappropriate|nsfw|content.?policy/iu.test(message)) {
+    return new ApiError(
+      422,
+      "content_rejected",
+      "That image could not be generated. Try a different, family-friendly description.",
+    );
+  }
+  return new ApiError(
+    503,
+    "model_unavailable",
+    "Image generation is temporarily unavailable. You can still upload your own artwork.",
+    true,
+    120,
+  );
+}
+
+async function handleGenerate(
+  request: Request,
+  env: Env,
+  requestId: string,
+  origin: string | undefined,
+): Promise<Response> {
+  const pepper = requireSecret(env.RATE_LIMIT_HASH_PEPPER);
+  const reportSecret = requireSecret(env.REPORT_TOKEN_SECRET);
+  const installationId = requireInstallationId(request);
+  const installationHash = await applyGenerationBurstLimits(request, env, installationId, pepper);
+  const body = await readJsonBody(request, MAX_GENERATE_BODY_BYTES);
+  const parsed = parseGenerationRequest(body, env.ENABLED_MODELS);
+  const model = findEnabledModel(parsed.model, env.ENABLED_MODELS);
+  if (!model) throw new ApiError(400, "model_unavailable", "That image model is not available");
+  const asset = findModelAssetSpec(model, parsed.assetKind);
+  if (!asset) {
+    throw new ApiError(
+      400,
+      "model_unavailable",
+      "That image model is not available for the selected artwork type",
+    );
+  }
+
+  const safetyNeurons = estimateSafetyNeurons(parsed.userPrompt);
+  const estimatedNeurons = safetyNeurons + model.estimateImageNeurons(asset, parsed.reference);
+  const globalNeuronBudget = parsePositiveLimit(env.DAILY_GLOBAL_NEURON_BUDGET, 8_000);
+  const retryAfter = secondsUntilNextUtcDay();
+  let reservation: Awaited<ReturnType<typeof reserveGenerationBudget>>;
+  try {
+    reservation = await reserveGenerationBudget(
+      env.QUOTA_DB,
+      installationHash,
+      model.alias,
+      estimatedNeurons,
+      globalNeuronBudget,
+    );
+  } catch {
+    throw new ApiError(
+      503,
+      "service_unavailable",
+      "Image generation is temporarily unavailable. You can still upload your own artwork.",
+      true,
+      60,
+    );
+  }
+  if (reservation.result === "model_exhausted") {
+    throw new ApiError(
+      429,
+      "model_daily_limit_reached",
+      `This device has used today's ${MODEL_DAILY_ATTEMPT_LIMIT} attempts for ${model.name}. Try another available model, come back tomorrow, or upload your own artwork.`,
+      true,
+      retryAfter,
+    );
+  }
+  if (reservation.result === "global_exhausted") {
+    throw new ApiError(
+      503,
+      "daily_quota_exhausted",
+      "Today's shared image-generation allowance has been used. Try again tomorrow or upload your own artwork.",
+      true,
+      retryAfter,
+    );
+  }
+
+  try {
+    await assertPromptSafe(env.AI, parsed.userPrompt, env.SAFETY_MODEL);
+  } catch (error) {
+    if (error instanceof UnsafePromptError) {
+      throw new ApiError(
+        422,
+        "content_rejected",
+        "That description cannot be used for image generation. Try a different, family-friendly idea.",
+      );
+    }
+    if (error instanceof SafetyServiceError) {
+      throw new ApiError(
+        503,
+        "service_unavailable",
+        "Safety screening is temporarily unavailable. You can still upload your own artwork.",
+        true,
+        120,
+      );
+    }
+    throw error;
+  }
+
+  let bytes: Uint8Array;
+  try {
+    bytes = await runImageModel(
+      env.AI,
+      model,
+      asset,
+      buildAssetPrompt(parsed.assetKind, parsed.userPrompt),
+      parsed.seed,
+      parsed.reference,
+    );
+  } catch (error) {
+    throw classifyModelError(error);
+  }
+  let image;
+  try {
+    image = validateGeneratedImage(
+      bytes,
+      asset.output.providerControlled ? undefined : asset.output,
+    );
+  } catch {
+    throw new ApiError(
+      503,
+      "model_unavailable",
+      "The image service returned an unusable result. Try again or upload your own artwork.",
+      true,
+      120,
+    );
+  }
+  const [sha, reportToken] = await Promise.all([
+    sha256Hex(bytes),
+    createReportToken(requestId, installationHash, reportSecret),
+  ]);
+  const headers = securityHeaders();
+  headers.set("Content-Type", image.mimeType);
+  headers.set("Content-Length", String(bytes.byteLength));
+  const extension = image.mimeType === "image/jpeg" ? "jpg" : image.mimeType.split("/")[1];
+  const filenameKind = parsed.assetKind.replaceAll("_", "-");
+  headers.set("Content-Disposition", `inline; filename="diywc-${filenameKind}-${requestId}.${extension}"`);
+  headers.set("X-DIYWC-Request-ID", requestId);
+  headers.set("X-DIYWC-Asset-Kind", parsed.assetKind);
+  headers.set("X-DIYWC-Report-Token", reportToken);
+  headers.set("X-DIYWC-Model", model.alias);
+  headers.set("X-DIYWC-SHA256", sha);
+  headers.set("X-DIYWC-Width", String(image.width));
+  headers.set("X-DIYWC-Height", String(image.height));
+  headers.set("X-DIYWC-Model-Attempts-Used", String(reservation.modelAttempts.used));
+  headers.set("X-DIYWC-Model-Attempts-Remaining", String(reservation.modelAttempts.remaining));
+  headers.set("X-DIYWC-Estimated-Neurons", String(reservation.estimatedNeurons));
+  headers.set(
+    "X-DIYWC-Global-Estimated-Neurons-Used",
+    String(reservation.globalNeurons.used),
+  );
+  headers.set(
+    "X-DIYWC-Global-Estimated-Neurons-Remaining",
+    String(reservation.globalNeurons.remaining),
+  );
+  addCorsHeaders(headers, origin);
+  const responseBody = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+  return new Response(responseBody, { status: 200, headers });
+}
+
+async function handleReport(
+  request: Request,
+  env: Env,
+  origin: string | undefined,
+): Promise<Response> {
+  const pepper = requireSecret(env.RATE_LIMIT_HASH_PEPPER);
+  const reportSecret = requireSecret(env.REPORT_TOKEN_SECRET);
+  const installationId = requireInstallationId(request);
+  const installationHash = await hashRateLimitKey("installation", installationId, pepper);
+  let allowed: { success: boolean };
+  try {
+    allowed = await env.REPORT_RATE_LIMITER.limit({ key: installationHash });
+  } catch {
+    throw new ApiError(503, "service_unavailable", "Reports are temporarily unavailable", true, 60);
+  }
+  if (!allowed.success) {
+    throw new ApiError(429, "rate_limited", "Please wait before sending another report", true, 60);
+  }
+  let report;
+  try {
+    report = parseReport(await readJsonBody(request, MAX_REPORT_BODY_BYTES));
+  } catch (error) {
+    if (error instanceof ApiError) throw error;
+    throw new ApiError(400, "invalid_request", error instanceof Error ? error.message : "Invalid report");
+  }
+  if (!(await verifyReportToken(report, installationHash, reportSecret))) {
+    throw new ApiError(403, "invalid_report_token", "This image report cannot be verified");
+  }
+  let reportId: string;
+  try {
+    reportId = await saveReport(env.QUOTA_DB, report, installationHash);
+  } catch {
+    throw new ApiError(503, "service_unavailable", "Reports are temporarily unavailable", true, 60);
+  }
+  return jsonResponse({ accepted: true, reportId }, 202, origin);
+}
+
+async function dispatch(
+  request: Request,
+  env: Env,
+  requestId: string,
+  origin: string | undefined,
+): Promise<Response> {
+  const url = new URL(request.url);
+  if (request.method === "OPTIONS") {
+    if (!origin) throw new ApiError(403, "origin_not_allowed", "CORS is not enabled");
+    const headers = securityHeaders();
+    headers.set("Access-Control-Max-Age", "600");
+    addCorsHeaders(headers, origin);
+    return new Response(null, { status: 204, headers });
+  }
+  if (url.pathname === "/") {
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      throw new ApiError(405, "method_not_allowed", "Method not allowed");
+    }
+    return landingPageResponse(request.method, origin);
+  }
+  if (url.pathname === "/model" || url.pathname === "/models") {
+    if (request.method !== "GET" && request.method !== "HEAD") {
+      throw new ApiError(405, "method_not_allowed", "Method not allowed");
+    }
+    return redirectToCanonicalModels(url, origin);
+  }
+  if (url.pathname === "/health") {
+    if (request.method !== "GET") throw new ApiError(405, "method_not_allowed", "Method not allowed");
+    return jsonResponse({ ok: true, apiVersion: API_VERSION }, 200, origin);
+  }
+  if (url.pathname === "/v1/models") {
+    if (request.method !== "GET") throw new ApiError(405, "method_not_allowed", "Method not allowed");
+    return jsonResponse(
+      {
+        apiVersion: API_VERSION,
+        defaultAssetKind: DEFAULT_ASSET_KIND,
+        promptLimits: {
+          minCodePoints: MIN_USER_PROMPT_CODE_POINTS,
+          maxCodePoints: MAX_USER_PROMPT_CODE_POINTS,
+        },
+        quota: {
+          dailyAttemptLimit: MODEL_DAILY_ATTEMPT_LIMIT,
+          dailyAttemptScope: "installation_model",
+          resets: "utc_day",
+        },
+        models: enabledModelSpecs(env.ENABLED_MODELS).map((model) => {
+          const medal = findModelAssetSpec(model, DEFAULT_ASSET_KIND);
+          if (!medal) throw new Error(`Enabled model ${model.alias} has no medal capability`);
+          return {
+            id: model.alias,
+            name: model.name,
+            description: model.description,
+            supportsReference: model.supportsReference,
+            dailyAttemptLimit: MODEL_DAILY_ATTEMPT_LIMIT,
+            baseEstimatedImageNeurons: medal.baseEstimatedImageNeurons,
+            output: medal.output,
+            ...(model.supportsReference
+              ? {
+                  referenceMaxBytes: MAX_REFERENCE_BYTES,
+                  referenceMaxWidth: MODEL_REFERENCE_MAX_EDGE,
+                  referenceMaxHeight: MODEL_REFERENCE_MAX_EDGE,
+                }
+              : {}),
+            assetKinds: model.assetKinds.map((asset) => ({
+              id: asset.id,
+              baseEstimatedImageNeurons: asset.baseEstimatedImageNeurons,
+              output: asset.output,
+              supportsReference: model.supportsReference,
+              ...(model.supportsReference
+                ? {
+                    referenceMaxBytes: MAX_REFERENCE_BYTES,
+                    referenceMaxWidth: MODEL_REFERENCE_MAX_EDGE,
+                    referenceMaxHeight: MODEL_REFERENCE_MAX_EDGE,
+                  }
+                : {}),
+            })),
+          };
+        }),
+        safety: {
+          model: env.SAFETY_MODEL || DEFAULT_SAFETY_MODEL,
+          estimatedNeuronsVaryByPrompt: true,
+        },
+      },
+      200,
+      origin,
+    );
+  }
+  if (url.pathname === "/v1/generate") {
+    if (request.method !== "POST") throw new ApiError(405, "method_not_allowed", "Method not allowed");
+    return handleGenerate(request, env, requestId, origin);
+  }
+  if (url.pathname === "/v1/report") {
+    if (request.method !== "POST") throw new ApiError(405, "method_not_allowed", "Method not allowed");
+    return handleReport(request, env, origin);
+  }
+  throw new ApiError(404, "not_found", "Endpoint not found");
+}
+
+export default {
+  async fetch(request: Request, env: Env): Promise<Response> {
+    const requestId = crypto.randomUUID();
+    let origin: string | undefined;
+    try {
+      origin = acceptedCorsOrigin(request, env);
+      return await dispatch(request, env, requestId, origin);
+    } catch (error) {
+      const apiError =
+        error instanceof ApiError
+          ? error
+          : new ApiError(
+              503,
+              "service_unavailable",
+              "Image generation is temporarily unavailable. You can still upload your own artwork.",
+              true,
+              60,
+            );
+      return errorResponse(apiError, requestId, origin);
+    }
+  },
+};

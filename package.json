@@ -1,0 +1,57 @@
+{
+  "name": "diy-walking-challenges-image-worker",
+  "version": "1.0.0",
+  "description": "Self-hostable Cloudflare Workers AI service for optional DIY Walking Challenges artwork generation",
+  "private": true,
+  "license": "Apache-2.0",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/diywalkingchallenges-code/diy-walking-challenges-image-worker.git"
+  },
+  "homepage": "https://github.com/diywalkingchallenges-code/diy-walking-challenges-image-worker#readme",
+  "bugs": {
+    "url": "https://github.com/diywalkingchallenges-code/diy-walking-challenges-image-worker/issues"
+  },
+  "keywords": [
+    "cloudflare-workers",
+    "workers-ai",
+    "self-hosted",
+    "image-generation"
+  ],
+  "type": "module",
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "scripts": {
+    "check": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "dev": "wrangler dev",
+    "db:migrate": "wrangler d1 migrations apply QUOTA_DB --remote",
+    "deploy:worker": "wrangler deploy",
+    "deploy": "npm run db:migrate && npm run deploy:worker"
+  },
+  "cloudflare": {
+    "bindings": {
+      "RATE_LIMIT_HASH_PEPPER": {
+        "description": "Private rate-limit code. Generate a new random value of at least 32 characters; never share or commit it."
+      },
+      "REPORT_TOKEN_SECRET": {
+        "description": "A second, different private code used to verify image reports. Generate a new random value of at least 32 characters."
+      },
+      "DAILY_GLOBAL_NEURON_BUDGET": {
+        "description": "The Worker's conservative daily image-generation budget. Keep 1000 for a cautious personal server."
+      },
+      "ALLOWED_ORIGINS": {
+        "description": "Leave blank for Android-only use. This is not an authentication setting."
+      }
+    }
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "5.20260903.1",
+    "@types/node": "^24.3.0",
+    "typescript": "^5.9.2",
+    "vitest": "3.2.7",
+    "wrangler": "4.129.0"
+  }
+}

@@ -1,0 +1,3 @@
+# Local development only. Generate independent random values of at least 32 characters.
+RATE_LIMIT_HASH_PEPPER=replace-with-a-random-server-only-secret
+REPORT_TOKEN_SECRET=replace-with-another-random-server-only-secret
