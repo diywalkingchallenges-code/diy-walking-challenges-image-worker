@@ -201,7 +201,7 @@ export function classifyCloudflareAiError(
         api: {
           status: 503,
           code: "workers_ai_quota_exhausted",
-          message: "Today's hosted image-generation allowance has been used. Try again tomorrow or upload your own artwork.",
+          message: "Today's hosted image-generation allowance has been used. Try again after the 00:00 UTC daily reset or upload your own artwork.",
           retryable: true,
           retryAfterSeconds: dailyQuotaRetryAfterSeconds,
         },

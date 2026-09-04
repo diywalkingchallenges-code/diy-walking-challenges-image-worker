@@ -61,7 +61,9 @@ parent prompt and optional reference image to the selected Cloudflare image mode
 result directly. The code does **not** save prompts, reference images, generated images, health data,
 route progress, race-room data, account profiles, or advertising data.
 
-The D1 database stores daily usage counters keyed by salted hashes. If a user reports a generated
+The D1 database stores daily usage counters keyed by secret-salted hashes. Raw installation and
+artwork-slot identifiers are not stored, and a slot hash is bound to its installation and artwork
+kind to prevent cross-installation correlation. If a user reports a generated
 image, it stores the request ID, hashed installation ID, report reason, optional report details, and
 timestamps. Report details are free-form, so clients should warn people not to type personal or
 sensitive information there. When Cloudflare image inference fails, D1 stores only the request ID,
@@ -81,7 +83,7 @@ Failure rows are pruned after 30 days on subsequent writes and capped at 5,000 r
 - Reference images require an explicit rights confirmation and strict format, size, and dimension
   checks.
 - Generated files are bounded and validated for format and dimensions before being returned.
-- Exact daily attempt and conservative compute-budget reservations are stored in D1.
+- Optional exact daily attempt controls and the conservative global compute-budget reservation use D1.
 - Provider failures become stable, plain-language API errors; raw upstream errors are never returned.
 - Minimal failure diagnostics exclude user content and use bounded D1 retention.
 - Browser access is denied by default; wildcard CORS is intentionally unsupported.
@@ -100,14 +102,23 @@ The checked-in production allowlist exposes two inexpensive model adapters:
 | `flux-schnell` | `@cf/black-forest-labs/flux-1-schnell` | Medals |
 | `flux2-klein-4b` | `@cf/black-forest-labs/flux-2-klein-4b` | Medals, banners, route maps, optional references |
 
-Each app installation gets three attempts per enabled model per UTC day. All artwork types made with
-one model share those three attempts. The default `DAILY_GLOBAL_NEURON_BUDGET` is `10000`, matching
+The private self-host template sets `ENFORCE_INSTALLATION_DAILY_CAPS=false`, so it does not impose an
+app-level per-installation or per-artwork daily cap. The service still uses its short burst controls,
+safety screening, and global budget. An operator who deliberately changes that setting to `true`
+gets six total attempts per installation per UTC day and one attempt per exact route map, completion
+medal, or individual milestone banner across all models. The default
+`DAILY_GLOBAL_NEURON_BUDGET` is `10000`, matching
 the free daily Workers AI allocation Cloudflare currently documents. Everyone using this Worker
 shares that account allowance, which resets at 00:00 UTC. A personal Worker has its own allowance
 instead of drawing from the DIY Walking Challenges hosted shared server. The internal counter is a
 conservative estimate, not Cloudflare's authoritative meter or a promise that every one of those
 10,000 Neurons will remain available; Cloudflare can change its policies and other Workers AI use
 on the same account also counts.
+
+New app versions send an opaque stable artwork-slot identifier. Older versions remain compatible:
+when caps are enabled, an omitted identifier shares one conservative legacy slot per artwork kind,
+so omission cannot bypass the limit. Daily slot rows older than 31 days are removed by the included
+scheduled cleanup.
 
 Several additional adapters remain in the source with `productionEnabled: false`. Editing only the
 environment variable cannot expose them. Enabling another model requires a code change, tests, and a

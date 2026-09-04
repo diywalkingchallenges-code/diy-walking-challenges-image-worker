@@ -39,6 +39,7 @@ feature. It provisions the required resources after you review the fields and se
 6. Keep these reviewed defaults:
 
    - `DAILY_GLOBAL_NEURON_BUDGET`: `10000`
+   - `ENFORCE_INSTALLATION_DAILY_CAPS`: `false` for your private server
    - `ENABLED_MODELS`: `flux2-klein-4b,flux-schnell`
    - `SAFETY_MODEL`: `@cf/meta/llama-guard-3-8b`
    - `ALLOWED_ORIGINS`: leave empty for the Android app
@@ -75,8 +76,11 @@ Check the official pages before changing limits or choosing a paid plan:
 - [Workers platform pricing](https://developers.cloudflare.com/workers/platform/pricing/)
 - [Workers AI limits](https://developers.cloudflare.com/workers-ai/platform/limits/)
 
-Everyone using your server shares its daily budget. Three attempts per model per phone does not mean
-that every phone is guaranteed six images; the shared budget may stop sooner.
+Everyone using your server shares its daily global budget. The private-server default has no
+per-installation or per-artwork daily cap. If you intentionally change
+`ENFORCE_INSTALLATION_DAILY_CAPS` to `true`, the Worker enforces six attempts per app installation
+and one attempt per specific medal, route map, or milestone banner per UTC day. The global budget
+may still stop generation sooner.
 
 ## Confirm it works
 
@@ -126,8 +130,10 @@ another path.
 
 ### Image generation says the daily limit was reached
 
-Wait for the UTC-day reset or upload artwork from the phone. Do not repeatedly retry; failed or
-ambiguous attempts are intentionally not refunded.
+If it reports the shared server allowance, wait for the UTC-day reset or upload artwork from the
+phone. If it reports an installation or artwork limit even though this is your private server,
+confirm `ENFORCE_INSTALLATION_DAILY_CAPS` is `false` under **Settings → Variables and Secrets** and
+redeploy. Do not repeatedly retry failed or ambiguous work.
 
 ### An image model is busy, times out, or rejects a harmless description
 
@@ -148,8 +154,9 @@ at least 32 characters.
 ### The database tables are missing
 
 From the GitHub-connected Cloudflare build settings, confirm the deploy command is `npm run deploy`.
-That command applies every pending migration, including the quota/report tables and the minimal
-provider-failure diagnostics table, before deploying the Worker.
+That command applies every pending migration, including the quota/report tables, privacy-hashed
+artwork-slot reservations, and the minimal provider-failure diagnostics table, before deploying the
+Worker.
 
 Never solve a setup error by publishing a private code, Cloudflare API token, database ID, or account
 ID in an issue. Use a [private GitHub security advisory](SECURITY.md) if the problem exposes sensitive

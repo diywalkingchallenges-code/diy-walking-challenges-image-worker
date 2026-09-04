@@ -26,8 +26,12 @@ and the artwork types each model can create.
     "maxCodePoints": 50
   },
   "quota": {
-    "dailyAttemptLimit": 3,
-    "dailyAttemptScope": "installation_model",
+    "dailyAttemptLimit": 6,
+    "dailyAttemptScope": "installation",
+    "installationDailyCapsEnforced": false,
+    "artworkSlotDailyAttemptLimit": 1,
+    "artworkSlotIdSupported": true,
+    "legacyMissingArtworkSlotScope": "installation_asset_kind",
     "resets": "utc_day"
   },
   "models": [
@@ -36,7 +40,7 @@ and the artwork types each model can create.
       "name": "Flux Schnell",
       "description": "Fast completion-medal artwork; not available for maps or banners",
       "supportsReference": false,
-      "dailyAttemptLimit": 3,
+      "dailyAttemptLimit": 6,
       "baseEstimatedImageNeurons": 58,
       "output": {
         "providerControlled": true
@@ -57,7 +61,7 @@ and the artwork types each model can create.
       "name": "Flux 2 Klein",
       "description": "Modern generation and reference-image editing",
       "supportsReference": true,
-      "dailyAttemptLimit": 3,
+      "dailyAttemptLimit": 6,
       "baseEstimatedImageNeurons": 27,
       "output": {
         "width": 512,
@@ -124,6 +128,9 @@ excludes mandatory prompt classification.
 The model-level `baseEstimatedImageNeurons`, `output`, `supportsReference`, and reference limit
 fields retain their original medal meanings for older clients. New clients should use the matching
 entry in `assetKinds`. A catalog without `assetKinds` is a legacy medal-only service.
+The model-level `dailyAttemptLimit` remains an integer for old parser compatibility, but under this
+policy it describes the installation-wide ceiling—not a separate allowance for each model. New
+clients must use the top-level scope and enforcement fields.
 
 Schnell's current official Workers AI input schema has no width or height fields, so its dimensions
 are provider-controlled and it is advertised only for medals. Klein receives exact server-owned
@@ -140,6 +147,13 @@ X-DIYWC-Installation-ID: 8ba9f618-438f-4caa-a499-dfe73bd0b3ac
 
 The installation ID must be an app-scoped random identifier. It must not be an Android ID,
 advertising ID, email address, account ID, or device serial number.
+
+New clients also send an opaque, stable `artworkSlotId` for the exact artwork being generated. It
+must be 8–160 ASCII letters, numbers, periods, underscores, colons, or hyphens; a random UUID or a
+client-side hash of a private stable UUID is recommended. Use the same value across model choices
+for one route's map, one route's completion medal, or one specific milestone banner. Never put a
+title, prompt, account identifier, or other user content in this field. The Worker binds the slot to
+the installation and artwork kind, then secret-hashes it before D1 storage.
 
 `assetKind` accepts `medal`, `milestone_banner`, or `route_map`. It is optional and defaults to
 `medal`, preserving the original request contract. New clients should omit it for medals so medal
@@ -161,6 +175,7 @@ Milestone banner request:
 ```json
 {
   "assetKind": "milestone_banner",
+  "artworkSlotId": "e81073a5e7a84dc9b3b90341de4a1cc9",
   "model": "flux2-klein-4b",
   "prompt": "Moonlit waterfall at a forest overlook"
 }
@@ -171,6 +186,7 @@ Decorative route-map request:
 ```json
 {
   "assetKind": "route_map",
+  "artworkSlotId": "a46828903478431fae18a2df9454eeb2",
   "model": "flux2-klein-4b",
   "prompt": "Coastal cliffs, pine forest, and a quiet bay"
 }
@@ -221,7 +237,11 @@ X-DIYWC-SHA256: <64 lowercase hexadecimal characters>
 X-DIYWC-Width: 1024
 X-DIYWC-Height: 512
 X-DIYWC-Model-Attempts-Used: 1
-X-DIYWC-Model-Attempts-Remaining: 2
+X-DIYWC-Model-Attempts-Remaining: 5
+X-DIYWC-Installation-Attempts-Used: 1
+X-DIYWC-Installation-Attempts-Remaining: 5
+X-DIYWC-Artwork-Slot-Attempts-Used: 1
+X-DIYWC-Artwork-Slot-Attempts-Remaining: 0
 X-DIYWC-Estimated-Neurons: 145
 X-DIYWC-Global-Estimated-Neurons-Used: 145
 X-DIYWC-Global-Estimated-Neurons-Remaining: 9855
@@ -232,14 +252,21 @@ the configured, allowlisted Llama Guard classifier. Unsafe prompts return `conte
 unavailable, malformed, or misconfigured classifier fails closed with `service_unavailable`; it
 never falls through to image generation.
 
-Each installation receives exactly three attempts per model per UTC day. Artwork types share that
-model counter: three mixed Klein requests are three Klein attempts, not three attempts per kind. The
-backend also makes an exact D1 reservation against a separate global conservative estimated-Neuron
-budget. The estimate includes variable Llama Guard headroom and the selected image output/reference
-tiles; it is not Cloudflare's authoritative bill. The model attempt is released when the global
-budget cannot fit the request or when that reservation fails. After a successful global reservation,
-the attempt and estimate are not refunded for classification rejection, cancellation, timeout, or
-upstream failure.
+When `installationDailyCapsEnforced` is true, each installation receives six total attempts per UTC
+day across every model and artwork type, and each specific artwork slot receives one attempt per UTC
+day across all models. A medal, route map, and every individual milestone banner therefore have
+independent slots. An older client that omits `artworkSlotId` is conservatively mapped to one shared
+legacy slot per installation and `assetKind`; omission never bypasses the cap. The backend also makes
+an exact D1 reservation against a separate global conservative estimated-Neuron budget. The estimate
+includes variable Llama Guard headroom and the selected image output/reference tiles; it is not
+Cloudflare's authoritative bill. Reservations made before classification/inference are not refunded
+after rejection, cancellation, timeout, or upstream failure.
+
+This self-host template sets `ENFORCE_INSTALLATION_DAILY_CAPS=false`. That removes the six-per-day
+and per-artwork-slot app limits, while burst controls, safety checks, and the configured global Neuron
+guard remain. In uncapped mode the new installation/slot headers are omitted. The legacy
+`X-DIYWC-Model-Attempts-*` headers remain as a non-authoritative compatibility sentinel for old app
+versions; clients must use `installationDailyCapsEnforced` as the source of truth.
 
 The service does not save generated images. Generation is intentionally non-idempotent: the Android
 client should generate only after an explicit tap and must not automatically retry an ambiguous
@@ -250,7 +277,7 @@ If an image does not fit in the remaining shared daily budget, `daily_quota_exha
 estimated request cost and the current estimated usage and remainder in both JSON and the
 `X-DIYWC-Estimated-Neurons`, `X-DIYWC-Global-Estimated-Neurons-Used`, and
 `X-DIYWC-Global-Estimated-Neurons-Remaining` headers. That rejection restores the installation's
-model attempt because classification and image inference never started.
+artwork-slot reservation because classification and image inference never started.
 
 When image inference fails, the Worker normalizes only Cloudflare's numeric internal error code and
 category. It never returns or records the provider's raw message or stack. D1 records only the
@@ -317,7 +344,8 @@ claiming that no allowance remains.
 
 Expected codes include `invalid_request`, `invalid_prompt`, `model_unavailable`, `content_rejected`,
 `model_busy`, `workers_ai_quota_exhausted`, `model_timeout`, `model_configuration_error`,
-`model_invalid_output`, `rate_limited`, `model_daily_limit_reached`, `daily_quota_exhausted`,
+`model_invalid_output`, `rate_limited`, `artwork_slot_daily_limit_reached`,
+`installation_daily_limit_reached`, `daily_quota_exhausted`,
 `invalid_report_token`, and `service_unavailable`. Image-provider failures use these stable results:
 
 | API code | Meaning | Retry behavior |
@@ -333,7 +361,7 @@ Expected codes include `invalid_request`, `invalid_prompt`, `model_unavailable`,
 The response never contains Cloudflare's internal code, raw error message, or stack. An unsupported
 model/artwork pairing also returns `model_unavailable`; an unknown artwork type returns
 `invalid_request`. A retryable response includes both `Retry-After` and `retryAfterSeconds` when a
-useful wait is known. Short burst limits and the three-attempt per-model limit return `429`; shared
+useful wait is known. Short burst, per-slot, and six-attempt installation limits return `429`; shared
 daily shutdowns return `503` so the app can prominently offer its own artwork upload fallback.
 
 The app should permit only one generation request at a time. It must not automatically retry an
