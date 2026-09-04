@@ -174,7 +174,7 @@ export const MODEL_SPECS: readonly ModelSpec[] = [
   {
     alias: "flux-schnell",
     name: "Flux Schnell",
-    description: "Fast, richly detailed concept art",
+    description: "Fast completion-medal artwork; not available for maps or banners",
     cloudflareId: "@cf/black-forest-labs/flux-1-schnell",
     supportsReference: false,
     productionEnabled: true,

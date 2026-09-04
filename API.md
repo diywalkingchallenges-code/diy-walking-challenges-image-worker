@@ -34,7 +34,7 @@ and the artwork types each model can create.
     {
       "id": "flux-schnell",
       "name": "Flux Schnell",
-      "description": "Fast, richly detailed concept art",
+      "description": "Fast completion-medal artwork; not available for maps or banners",
       "supportsReference": false,
       "dailyAttemptLimit": 3,
       "baseEstimatedImageNeurons": 58,
@@ -245,6 +245,13 @@ client should generate only after an explicit tap and must not automatically ret
 timeout. Canceling the download does not guarantee that already-started classification or inference
 is canceled, and the reserved quota remains consumed.
 
+When image inference fails, the Worker normalizes only Cloudflare's numeric internal error code and
+category. It never returns or records the provider's raw message or stack. D1 records only the
+request ID, model alias, artwork type, normalized provider code (`unknown` when unavailable),
+category, and timestamp. Writes also remove rows older than 30 days and cap the table at 5,000 rows.
+The structured console event contains those same fields only; prompts, images, network addresses,
+installation identifiers and hashes, and raw provider errors are excluded.
+
 ## `POST /v1/report`
 
 This route lets the Android client place a **Report image** action on every generated candidate
@@ -298,12 +305,25 @@ Errors are JSON and always include a correlation ID:
 ```
 
 Expected codes include `invalid_request`, `invalid_prompt`, `model_unavailable`, `content_rejected`,
-`rate_limited`, `model_daily_limit_reached`, `daily_quota_exhausted`, `invalid_report_token`, and
-`service_unavailable`. An unsupported model/artwork pairing returns `model_unavailable`; an unknown
-artwork type returns `invalid_request`. A retryable response includes both `Retry-After` and
-`retryAfterSeconds` when a useful wait is known. Short burst limits and the three-attempt per-model
-limit return `429`; the shared daily shutdown returns `503` so the app can prominently offer its own
-artwork upload fallback.
+`model_busy`, `workers_ai_quota_exhausted`, `model_timeout`, `model_configuration_error`,
+`model_invalid_output`, `rate_limited`, `model_daily_limit_reached`, `daily_quota_exhausted`,
+`invalid_report_token`, and `service_unavailable`. Image-provider failures use these stable results:
+
+| API code | Meaning | Retry behavior |
+|---|---|---|
+| `content_rejected` | The provider's image filter declined the request. | Reword the description; no automatic retry. |
+| `model_busy` | The provider has no current model capacity. | Retryable after 60 seconds. |
+| `workers_ai_quota_exhausted` | The hosting account's Workers AI daily allowance is exhausted. | Retryable after the next UTC-day reset. |
+| `model_timeout` | Inference timed out or was aborted upstream. | Retryable after 120 seconds, but only after another explicit user action. |
+| `model_configuration_error` | The model ID, account access, agreement, plan, or request integration needs operator attention. | Not retryable by the client. |
+| `model_invalid_output` | The provider returned bytes or dimensions that failed image validation. | Retryable after 120 seconds. |
+| `model_unavailable` | Unknown provider failures retain the generic fallback. | Retryable after 120 seconds. |
+
+The response never contains Cloudflare's internal code, raw error message, or stack. An unsupported
+model/artwork pairing also returns `model_unavailable`; an unknown artwork type returns
+`invalid_request`. A retryable response includes both `Retry-After` and `retryAfterSeconds` when a
+useful wait is known. Short burst limits and the three-attempt per-model limit return `429`; shared
+daily shutdowns return `503` so the app can prominently offer its own artwork upload fallback.
 
 The app should permit only one generation request at a time. It must not automatically retry an
 ambiguous timeout: inference may have started and its reserved attempt remains consumed.

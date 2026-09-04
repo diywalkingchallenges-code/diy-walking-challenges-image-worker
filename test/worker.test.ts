@@ -47,6 +47,7 @@ function base64(bytes: Uint8Array): string {
 }
 
 type MockDatabaseOptions = {
+  diagnosticPersistenceFailure?: boolean;
   globalBudgetExhausted?: boolean;
   modelAttemptsExhausted?: boolean;
 };
@@ -69,6 +70,10 @@ function mockDatabase(options: MockDatabaseOptions = {}): D1Database {
         }),
       })),
     })),
+    batch: vi.fn(async (statements: D1PreparedStatement[]) => {
+      if (options.diagnosticPersistenceFailure) throw new Error("private D1 failure detail");
+      return statements.map(() => ({ success: true }));
+    }),
   } as unknown as D1Database;
 }
 
@@ -233,6 +238,8 @@ describe("model catalog", () => {
       quota: { dailyAttemptLimit: number; dailyAttemptScope: string; resets: string };
       models: Array<{
         id: string;
+        name: string;
+        description: string;
         supportsReference: boolean;
         assetKinds: Array<{
           id: string;
@@ -254,6 +261,8 @@ describe("model catalog", () => {
     expect(body.models).toEqual([
       expect.objectContaining({
         id: "flux-schnell",
+        name: "Flux Schnell",
+        description: "Fast completion-medal artwork; not available for maps or banners",
         supportsReference: false,
         dailyAttemptLimit: 3,
         baseEstimatedImageNeurons: 58,
@@ -728,7 +737,7 @@ describe("POST /v1/generate", () => {
     );
     expect(response.status).toBe(503);
     await expect(response.json()).resolves.toMatchObject({
-      error: { code: "model_unavailable", retryable: true },
+      error: { code: "model_invalid_output", retryable: true },
     });
     expect(ai.run).toHaveBeenCalledTimes(2);
   });
@@ -748,6 +757,46 @@ describe("POST /v1/generate", () => {
     expect(response.status).toBe(200);
     expect(response.headers.get("X-DIYWC-Width")).toBe("1024");
     expect(response.headers.get("X-DIYWC-Height")).toBe("512");
+  });
+
+  it("returns a safe mapped provider error even when diagnostic persistence fails", async () => {
+    const rawMessage = "No more data centers; internal tenant secret";
+    const prompt = "private sentinel forest medal";
+    const ai = {
+      run: vi.fn(async (model: string) => {
+        if (model === "@cf/meta/llama-guard-3-8b") return { response: "safe" };
+        throw { cause: { error: { internalCode: 3040, message: rawMessage } } };
+      }),
+    };
+    const db = mockDatabase({ diagnosticPersistenceFailure: true });
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const response = await worker.fetch(
+      postGenerate({ model: "flux-schnell", prompt }),
+      mockEnv({ AI: ai, QUOTA_DB: db }),
+    );
+    const responseText = await response.text();
+    const body = JSON.parse(responseText) as {
+      error: { code: string; message: string; retryable: boolean; requestId: string };
+    };
+
+    expect(response.status).toBe(503);
+    expect(response.headers.get("Retry-After")).toBe("60");
+    expect(body.error).toMatchObject({
+      code: "model_busy",
+      message: "The image model is busy right now. Try again shortly or upload your own artwork.",
+      retryable: true,
+    });
+    expect(responseText).not.toContain(rawMessage);
+    expect(body.error).not.toHaveProperty("providerCode");
+    const serializedLogs = JSON.stringify(consoleError.mock.calls);
+    expect(serializedLogs).toContain(body.error.requestId);
+    expect(serializedLogs).toContain('"providerCode":"3040"');
+    expect(serializedLogs).not.toContain(rawMessage);
+    expect(serializedLogs).not.toContain(prompt);
+    expect(serializedLogs).not.toContain(INSTALLATION_ID);
+    expect(serializedLogs).not.toContain("@cf/black-forest-labs/flux-1-schnell");
+    expect(db.batch).toHaveBeenCalledOnce();
+    consoleError.mockRestore();
   });
 
   it("fails closed when Llama Guard marks a prompt unsafe", async () => {
