@@ -17,6 +17,7 @@ export interface Env {
   RATE_LIMIT_HASH_PEPPER?: string;
   REPORT_TOKEN_SECRET?: string;
   DAILY_GLOBAL_NEURON_BUDGET?: string;
+  ENFORCE_INSTALLATION_DAILY_CAPS?: string;
   ALLOWED_ORIGINS?: string;
   ENABLED_MODELS?: string;
   SAFETY_MODEL?: string;
@@ -31,6 +32,7 @@ export type ReferenceImage = {
 
 export type ParsedGenerationRequest = {
   assetKind: AssetKind;
+  artworkSlotId?: string;
   model: string;
   userPrompt: string;
   seed?: number;

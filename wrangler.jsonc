@@ -5,6 +5,9 @@
 	"compatibility_date": "2026-09-04",
 	"workers_dev": true,
 	"preview_urls": false,
+	"triggers": {
+		"crons": ["17 4 * * *"]
+	},
 	"observability": {
 		"enabled": true,
 		"head_sampling_rate": 0.1
@@ -53,6 +56,7 @@
 	],
 	"vars": {
 		"DAILY_GLOBAL_NEURON_BUDGET": "10000",
+		"ENFORCE_INSTALLATION_DAILY_CAPS": "false",
 		"ALLOWED_ORIGINS": "",
 		"ENABLED_MODELS": "flux2-klein-4b,flux-schnell",
 		"SAFETY_MODEL": "@cf/meta/llama-guard-3-8b"

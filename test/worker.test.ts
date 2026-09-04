@@ -50,7 +50,9 @@ type MockDatabaseOptions = {
   diagnosticPersistenceFailure?: boolean;
   globalBudgetExhausted?: boolean;
   globalBudgetUsed?: number;
-  modelAttemptsExhausted?: boolean;
+  installationAttemptsExhausted?: boolean;
+  artworkSlotExhausted?: boolean;
+  installationAttemptsUsed?: number;
 };
 
 function mockDatabase(options: MockDatabaseOptions = {}): D1Database {
@@ -58,8 +60,16 @@ function mockDatabase(options: MockDatabaseOptions = {}): D1Database {
     prepare: vi.fn((sql: string) => ({
       bind: vi.fn((...values: unknown[]) => ({
         first: vi.fn(async () => {
-          if (sql.includes("daily_installation_model_attempts")) {
-            return options.modelAttemptsExhausted ? null : { attempts: 1 };
+          if (sql.includes("INSERT INTO daily_installation_artwork_slots")) {
+            return options.installationAttemptsExhausted || options.artworkSlotExhausted
+              ? null
+              : { reserved: 1 };
+          }
+          if (sql.includes("COUNT(*) AS attempts")) {
+            return { attempts: options.installationAttemptsUsed ?? 1 };
+          }
+          if (sql.includes("SELECT 1 AS reserved")) {
+            return options.artworkSlotExhausted ? { reserved: 1 } : null;
           }
           if (sql.includes("daily_global_neuron_budget")) {
             if (sql.trimStart().startsWith("SELECT")) {
@@ -103,6 +113,7 @@ function mockEnv(
     RATE_LIMIT_HASH_PEPPER: PEPPER,
     REPORT_TOKEN_SECRET: REPORT_SECRET,
     DAILY_GLOBAL_NEURON_BUDGET: "8000",
+    ENFORCE_INSTALLATION_DAILY_CAPS: "true",
     ENABLED_MODELS: "flux2-klein-4b,flux-schnell",
     SAFETY_MODEL: "@cf/meta/llama-guard-3-8b",
     ALLOWED_ORIGINS: "",
@@ -242,7 +253,15 @@ describe("model catalog", () => {
     const body = (await response.json()) as {
       defaultAssetKind: string;
       promptLimits: { minCodePoints: number; maxCodePoints: number };
-      quota: { dailyAttemptLimit: number; dailyAttemptScope: string; resets: string };
+      quota: {
+        dailyAttemptLimit: number;
+        dailyAttemptScope: string;
+        installationDailyCapsEnforced: boolean;
+        artworkSlotDailyAttemptLimit: number;
+        artworkSlotIdSupported: boolean;
+        legacyMissingArtworkSlotScope: string;
+        resets: string;
+      };
       models: Array<{
         id: string;
         name: string;
@@ -261,8 +280,12 @@ describe("model catalog", () => {
     expect(body.defaultAssetKind).toBe("medal");
     expect(body.promptLimits).toEqual({ minCodePoints: 3, maxCodePoints: 50 });
     expect(body.quota).toEqual({
-      dailyAttemptLimit: 3,
-      dailyAttemptScope: "installation_model",
+      dailyAttemptLimit: 6,
+      dailyAttemptScope: "installation",
+      installationDailyCapsEnforced: true,
+      artworkSlotDailyAttemptLimit: 1,
+      artworkSlotIdSupported: true,
+      legacyMissingArtworkSlotScope: "installation_asset_kind",
       resets: "utc_day",
     });
     expect(body.models).toEqual([
@@ -271,14 +294,14 @@ describe("model catalog", () => {
         name: "Flux Schnell",
         description: "Fast completion-medal artwork; not available for maps or banners",
         supportsReference: false,
-        dailyAttemptLimit: 3,
+        dailyAttemptLimit: 6,
         baseEstimatedImageNeurons: 58,
         output: { providerControlled: true },
       }),
       expect.objectContaining({
         id: "flux2-klein-4b",
         supportsReference: true,
-        dailyAttemptLimit: 3,
+        dailyAttemptLimit: 6,
         baseEstimatedImageNeurons: 27,
         output: { width: 512, height: 512, providerControlled: false },
       }),
@@ -331,6 +354,15 @@ describe("model catalog", () => {
     );
     const body = (await response.json()) as { models: Array<{ id: string }> };
     expect(body.models.map((model) => model.id)).toEqual(["flux-schnell", "flux2-klein-4b"]);
+  });
+
+  it("advertises explicitly uncapped private-server installation policy", async () => {
+    const response = await worker.fetch(
+      new Request("https://medals.example/v1/models"),
+      mockEnv({ ENFORCE_INSTALLATION_DAILY_CAPS: "false" }),
+    );
+    const body = await response.json() as { quota: { installationDailyCapsEnforced: boolean } };
+    expect(body.quota.installationDailyCapsEnforced).toBe(false);
   });
 
   it("requests each reviewed Klein output and budgets output and reference tiles", async () => {
@@ -470,245 +502,142 @@ Originality requirement: Create new artwork. Do not reproduce branded or copyrig
 });
 
 describe("daily budget policy", () => {
-  it("keys the exact three-attempt reservation by installation and model", async () => {
-    const binds: unknown[][] = [];
+  const budgetRequest = (overrides: Record<string, unknown> = {}) => ({
+    installationHash: "hashed-installation",
+    artworkSlotHash: "hashed-artwork-slot",
+    reservationId: "request-12345678",
+    assetKind: "medal",
+    estimatedNeurons: 153,
+    globalNeuronBudget: 8_000,
+    enforceInstallationDailyCaps: true,
+    instant: new Date("2026-09-03T12:00:00Z"),
+    ...overrides,
+  });
+
+  it("atomically reserves one artwork slot and counts it toward the six-image total", async () => {
+    const bound: Array<{ sql: string; values: unknown[] }> = [];
     const db = {
       prepare: vi.fn((sql: string) => ({
         bind: vi.fn((...values: unknown[]) => {
-          binds.push(values);
+          bound.push({ sql, values });
           return {
-            first: vi.fn(async () =>
-              sql.includes("daily_installation_model_attempts")
-                ? { attempts: 1 }
-                : { estimated_neurons_used: 153 },
-            ),
+            first: vi.fn(async () => {
+              if (sql.includes("INSERT INTO daily_installation_artwork_slots")) {
+                return { reserved: 1 };
+              }
+              if (sql.includes("COUNT(*) AS attempts")) return { attempts: 2 };
+              if (sql.includes("daily_global_neuron_budget")) return { estimated_neurons_used: 153 };
+              return null;
+            }),
           };
         }),
       })),
     } as unknown as D1Database;
-    const result = await reserveGenerationBudget(
-      db,
-      "hashed-installation",
-      "flux-schnell",
-      153,
-      8_000,
-      new Date("2026-09-03T12:00:00Z"),
-    );
-    expect(result).toMatchObject({
+
+    await expect(reserveGenerationBudget(db, budgetRequest())).resolves.toMatchObject({
       result: "reserved",
-      modelAttempts: { used: 1, remaining: 2 },
+      installationAttempts: { used: 2, remaining: 4 },
+      artworkSlotAttempts: { used: 1, remaining: 0 },
       globalNeurons: { used: 153, remaining: 7_847 },
     });
-    expect(binds[0]).toEqual([
+    const slotInsert = bound.find(({ sql }) => sql.includes("INSERT INTO daily_installation_artwork_slots"))!;
+    expect(slotInsert.sql).toContain("COUNT(*)");
+    expect(slotInsert.values.slice(0, 5)).toEqual([
       "2026-09-03",
       "hashed-installation",
-      "flux-schnell",
-      "2026-09-03T12:00:00.000Z",
-      3,
+      "hashed-artwork-slot",
+      "medal",
+      "request-12345678",
     ]);
-    expect(binds[1]).toEqual([
-      "2026-09-03",
-      153,
-      "2026-09-03T12:00:00.000Z",
-      8_000,
-    ]);
+    expect(slotInsert.values[6]).toBe(6);
   });
 
-  it("enforces the global cap when the day's counter does not exist yet", async () => {
-    const statements: string[] = [];
-    let modelAttempts = 0;
-    const db = {
-      prepare: vi.fn((sql: string) => {
-        statements.push(sql);
-        return {
-          bind: vi.fn((...values: unknown[]) => ({
-            first: vi.fn(async () => {
-              if (sql.includes("daily_installation_model_attempts")) {
-                modelAttempts += 1;
-                return { attempts: modelAttempts };
-              }
-              if (sql.trimStart().startsWith("SELECT")) return null;
-              if (sql.includes("daily_global_neuron_budget")) {
-                return Number(values[1]) <= Number(values[3])
-                  ? { estimated_neurons_used: Number(values[1]) }
-                  : null;
-              }
-              return null;
-            }),
-            run: vi.fn(async () => {
-              if (sql.includes("daily_installation_model_attempts")) {
-                modelAttempts = Math.max(0, modelAttempts - 1);
-              }
-              return { success: true };
-            }),
-          })),
-        };
-      }),
-    } as unknown as D1Database;
-
-    const result = await reserveGenerationBudget(
-      db,
-      "hashed-installation",
-      "flux-schnell",
-      10_001,
-      10_000,
-      new Date("2026-09-03T12:00:00Z"),
-    );
-
-    expect(result).toEqual({
-      result: "global_exhausted",
-      globalNeurons: { used: 0, remaining: 10_000 },
-      estimatedNeurons: 10_001,
+  it("rejects reuse of the same artwork slot across models before global reservation", async () => {
+    const db = mockDatabase({ artworkSlotExhausted: true, installationAttemptsUsed: 1 });
+    await expect(reserveGenerationBudget(db, budgetRequest())).resolves.toEqual({
+      result: "artwork_slot_exhausted",
     });
-    expect(modelAttempts).toBe(0);
-    expect(statements.find((sql) => sql.includes("daily_global_neuron_budget")))
-      .toMatch(/SELECT \?1, \?2, 1, \?3\s+WHERE \?2 <= \?4/u);
+    expect(vi.mocked(db.prepare).mock.calls.some(([sql]) =>
+      String(sql).includes("INSERT INTO daily_global_neuron_budget"),
+    )).toBe(false);
   });
 
-  it("does not consume a model attempt when the shared budget cannot fit the request", async () => {
-    let modelAttempts = 0;
+  it("rejects a seventh distinct artwork slot for an installation", async () => {
+    const db = mockDatabase({ installationAttemptsExhausted: true, installationAttemptsUsed: 6 });
+    await expect(reserveGenerationBudget(db, budgetRequest())).resolves.toEqual({
+      result: "installation_exhausted",
+    });
+  });
+
+  it("releases only its own slot reservation when the global budget cannot fit", async () => {
+    const runs: Array<{ sql: string; values: unknown[] }> = [];
     const db = {
       prepare: vi.fn((sql: string) => ({
         bind: vi.fn((...values: unknown[]) => ({
           first: vi.fn(async () => {
-            if (sql.includes("daily_installation_model_attempts")) {
-              modelAttempts += 1;
-              return { attempts: modelAttempts };
-            }
-            if (sql.trimStart().startsWith("SELECT")) {
-              return { estimated_neurons_used: 9_950 };
-            }
+            if (sql.includes("INSERT INTO daily_installation_artwork_slots")) return { reserved: 1 };
+            if (sql.includes("COUNT(*) AS attempts")) return { attempts: 1 };
+            if (sql.startsWith("SELECT estimated_neurons_used")) return { estimated_neurons_used: 9_950 };
             if (sql.includes("daily_global_neuron_budget")) return null;
             return null;
           }),
           run: vi.fn(async () => {
-            if (sql.includes("daily_installation_model_attempts")) {
-              modelAttempts = Math.max(0, modelAttempts - 1);
-            }
+            runs.push({ sql, values });
             return { success: true };
           }),
         })),
       })),
     } as unknown as D1Database;
-
-    const result = await reserveGenerationBudget(
-      db,
-      "hashed-installation",
-      "flux-schnell",
-      100,
-      10_000,
-      new Date("2026-09-03T12:00:00Z"),
-    );
-
+    const result = await reserveGenerationBudget(db, budgetRequest({
+      estimatedNeurons: 100,
+      globalNeuronBudget: 10_000,
+    }));
     expect(result).toEqual({
       result: "global_exhausted",
       globalNeurons: { used: 9_950, remaining: 50 },
       estimatedNeurons: 100,
     });
-    expect(modelAttempts).toBe(0);
+    expect(runs).toHaveLength(1);
+    expect(runs[0].sql).toContain("reservation_id = ?4");
+    expect(runs[0].values).toEqual([
+      "2026-09-03", "hashed-installation", "hashed-artwork-slot", "request-12345678",
+    ]);
   });
 
-  it("rolls back a model attempt when the shared budget write fails", async () => {
-    let modelAttempts = 0;
-    const db = {
-      prepare: vi.fn((sql: string) => ({
-        bind: vi.fn(() => ({
-          first: vi.fn(async () => {
-            if (sql.includes("daily_installation_model_attempts")) {
-              modelAttempts += 1;
-              return { attempts: modelAttempts };
-            }
-            if (sql.includes("daily_global_neuron_budget")) {
-              throw new Error("D1 temporarily unavailable");
-            }
-            return null;
-          }),
-          run: vi.fn(async () => {
-            if (sql.includes("daily_installation_model_attempts")) {
-              modelAttempts = Math.max(0, modelAttempts - 1);
-            }
-            return { success: true };
-          }),
-        })),
-      })),
-    } as unknown as D1Database;
-
-    await expect(
-      reserveGenerationBudget(
-        db,
-        "hashed-installation",
-        "flux-schnell",
-        100,
-        10_000,
-        new Date("2026-09-03T12:00:00Z"),
-      ),
-    ).rejects.toThrow("D1 temporarily unavailable");
-    expect(modelAttempts).toBe(0);
-  });
-
-  it("shares a model's three daily attempts across all of its artwork types", async () => {
-    let attempts = 0;
-    let globalNeurons = 0;
-    const reservedAliases: string[] = [];
+  it("releases its request-owned slot if reading the installation total fails", async () => {
+    const released: unknown[][] = [];
     const db = {
       prepare: vi.fn((sql: string) => ({
         bind: vi.fn((...values: unknown[]) => ({
           first: vi.fn(async () => {
-            if (sql.includes("daily_installation_model_attempts")) {
-              reservedAliases.push(String(values[2]));
-              if (attempts >= 3) return null;
-              attempts += 1;
-              return { attempts };
-            }
-            if (sql.trimStart().startsWith("SELECT")) {
-              return { estimated_neurons_used: globalNeurons };
-            }
-            if (sql.includes("daily_global_neuron_budget")) {
-              globalNeurons += Number(values[1]);
-              return { estimated_neurons_used: globalNeurons };
-            }
+            if (sql.includes("INSERT INTO daily_installation_artwork_slots")) return { reserved: 1 };
+            if (sql.includes("COUNT(*) AS attempts")) throw new Error("D1 read failed");
             return null;
           }),
           run: vi.fn(async () => {
-            if (sql.includes("daily_global_neuron_budget")) {
-              globalNeurons = Math.max(0, globalNeurons - Number(values[1]));
-            }
+            if (sql.startsWith("DELETE FROM daily_installation_artwork_slots")) released.push(values);
             return { success: true };
           }),
         })),
       })),
     } as unknown as D1Database;
-    const ai = {
-      run: vi.fn(async (model: string, inputs: unknown) => {
-        if (model === "@cf/meta/llama-guard-3-8b") return { response: "safe" };
-        const multipart = inputs as {
-          multipart: { body: ReadableStream<Uint8Array>; contentType: string };
-        };
-        const form = await new Response(multipart.multipart.body, {
-          headers: { "Content-Type": multipart.multipart.contentType },
-        }).formData();
-        return {
-          image: base64(fakePng(Number(form.get("width")), Number(form.get("height")))),
-        };
-      }),
-    };
-    const env = mockEnv({ AI: ai, QUOTA_DB: db });
-    const requests = [
-      { model: "flux2-klein-4b", prompt: "forest medal" },
-      { model: "flux2-klein-4b", assetKind: "milestone_banner", prompt: "forest banner" },
-      { model: "flux2-klein-4b", assetKind: "route_map", prompt: "forest map" },
-      { model: "flux2-klein-4b", assetKind: "route_map", prompt: "another map" },
-    ];
-    const responses = [];
-    for (const request of requests) responses.push(await worker.fetch(postGenerate(request), env));
+    await expect(reserveGenerationBudget(db, budgetRequest())).rejects.toThrow("D1 read failed");
+    expect(released).toEqual([[
+      "2026-09-03", "hashed-installation", "hashed-artwork-slot", "request-12345678",
+    ]]);
+  });
 
-    expect(responses.slice(0, 3).map((response) => response.status)).toEqual([200, 200, 200]);
-    expect(responses[3].status).toBe(429);
-    await expect(responses[3].json()).resolves.toMatchObject({
-      error: { code: "model_daily_limit_reached" },
+  it("skips installation and slot caps when a private server disables them", async () => {
+    const db = mockDatabase();
+    await expect(reserveGenerationBudget(db, budgetRequest({
+      enforceInstallationDailyCaps: false,
+    }))).resolves.toMatchObject({
+      result: "reserved",
+      globalNeurons: { used: 153, remaining: 7_847 },
     });
-    expect(reservedAliases).toEqual(Array(4).fill("flux2-klein-4b"));
-    expect(ai.run).toHaveBeenCalledTimes(6);
+    expect(vi.mocked(db.prepare).mock.calls.every(([sql]) =>
+      !String(sql).includes("daily_installation_artwork_slots"),
+    )).toBe(true);
   });
 });
 
@@ -761,7 +690,11 @@ describe("POST /v1/generate", () => {
     expect(response.headers.get("X-DIYWC-Asset-Kind")).toBe("medal");
     expect(response.headers.get("X-DIYWC-Model")).toBe("flux-schnell");
     expect(response.headers.get("X-DIYWC-Model-Attempts-Used")).toBe("1");
-    expect(response.headers.get("X-DIYWC-Model-Attempts-Remaining")).toBe("2");
+    expect(response.headers.get("X-DIYWC-Model-Attempts-Remaining")).toBe("5");
+    expect(response.headers.get("X-DIYWC-Installation-Attempts-Used")).toBe("1");
+    expect(response.headers.get("X-DIYWC-Installation-Attempts-Remaining")).toBe("5");
+    expect(response.headers.get("X-DIYWC-Artwork-Slot-Attempts-Used")).toBe("1");
+    expect(response.headers.get("X-DIYWC-Artwork-Slot-Attempts-Remaining")).toBe("0");
     expect(response.headers.get("X-DIYWC-Estimated-Neurons")).toBe(
       String(58 + estimateSafetyNeurons("an original copper forest compass")),
     );
@@ -1122,15 +1055,53 @@ describe("POST /v1/generate", () => {
     expect(response.headers.get("X-DIYWC-Global-Estimated-Neurons-Remaining")).toBe("50");
   });
 
-  it("returns a distinct daily-limit error after three attempts for this model", async () => {
+  it("returns a distinct daily-limit error after six attempts for this installation", async () => {
     const response = await worker.fetch(
       postGenerate({ model: "flux2-klein-4b", prompt: "a medal" }),
-      mockEnv({}, { modelAttemptsExhausted: true }),
+      mockEnv({}, { installationAttemptsExhausted: true, installationAttemptsUsed: 6 }),
     );
     expect(response.status).toBe(429);
     await expect(response.json()).resolves.toMatchObject({
-      error: { code: "model_daily_limit_reached", retryable: true },
+      error: { code: "installation_daily_limit_reached", retryable: true },
     });
+  });
+
+  it("returns a distinct daily-limit error when the same artwork slot is reused", async () => {
+    const response = await worker.fetch(
+      postGenerate({
+        model: "flux2-klein-4b",
+        prompt: "a medal",
+        artworkSlotId: "slot-12345678",
+      }),
+      mockEnv({}, { artworkSlotExhausted: true, installationAttemptsUsed: 1 }),
+    );
+    expect(response.status).toBe(429);
+    await expect(response.json()).resolves.toMatchObject({
+      error: { code: "artwork_slot_daily_limit_reached", retryable: true },
+    });
+  });
+
+  it("validates opaque artwork slot identifiers before reserving quota", async () => {
+    const env = mockEnv();
+    const response = await worker.fetch(
+      postGenerate({ model: "flux-schnell", prompt: "a medal", artworkSlotId: "route title" }),
+      env,
+    );
+    expect(response.status).toBe(400);
+    await expect(response.json()).resolves.toMatchObject({ error: { code: "invalid_request" } });
+    expect(env.AI.run).not.toHaveBeenCalled();
+  });
+
+  it("keeps legacy attempt headers but omits authoritative cap headers on uncapped private servers", async () => {
+    const response = await worker.fetch(
+      postGenerate({ model: "flux-schnell", prompt: "a private medal" }),
+      mockEnv({ ENFORCE_INSTALLATION_DAILY_CAPS: "false" }),
+    );
+    expect(response.status).toBe(200);
+    expect(response.headers.get("X-DIYWC-Model-Attempts-Used")).toBe("0");
+    expect(response.headers.get("X-DIYWC-Model-Attempts-Remaining")).toBe("6");
+    expect(response.headers.get("X-DIYWC-Installation-Attempts-Remaining")).toBeNull();
+    expect(response.headers.get("X-DIYWC-Artwork-Slot-Attempts-Remaining")).toBeNull();
   });
 
   it("denies browser origins unless explicitly allowlisted", async () => {

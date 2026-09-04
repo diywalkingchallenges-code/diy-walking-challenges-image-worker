@@ -30,17 +30,21 @@ the Android app, a GitHub Actions variable, an issue, or a log. Local `.dev.vars
 ignored, but operators should still check staged changes before every commit.
 
 If a secret is exposed, replace it in Cloudflare immediately. Changing the rate-limit pepper resets
-the effective per-installation counters; changing the report-token secret invalidates previously
+the effective per-installation and artwork-slot counters; changing the report-token secret invalidates previously
 issued report tokens.
 
 ## Important limits of the current design
 
 - The app installation ID is pseudonymous rate-limit input, not authentication or device
   attestation. A determined caller can replace or spoof it.
+- Artwork-slot IDs are validated, bound to the installation and artwork kind, and secret-hashed
+  before storage. They are rate-limit inputs rather than authentication and can also be replaced.
 - IP limits are a secondary abuse signal; shared networks may share one IP and attackers may change
   IPs.
 - D1 reservations are the authoritative application limits, but the estimated Neuron budget is not
   Cloudflare's billing meter.
+- The self-host template intentionally disables per-installation and per-artwork daily caps. Its
+  global Neuron guard, burst controls, and Cloudflare account limits remain active.
 - Text safety screening does not inspect reference-image or generated-image pixels.
 - CORS controls browser origins; it does not authenticate native apps.
 - The Worker does not currently verify Play Integrity or Firebase App Check tokens.

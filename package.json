@@ -1,6 +1,6 @@
 {
   "name": "diy-walking-challenges-image-worker",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "Self-hostable Cloudflare Workers AI service for optional DIY Walking Challenges artwork generation",
   "private": true,
   "license": "Apache-2.0",
@@ -42,6 +42,9 @@
       },
       "DAILY_GLOBAL_NEURON_BUDGET": {
         "description": "The Worker's conservative daily image-generation budget. The reviewed 10000 default matches Cloudflare's currently documented free daily Workers AI allocation; limits can change."
+      },
+      "ENFORCE_INSTALLATION_DAILY_CAPS": {
+        "description": "Keep false for an uncapped private server. Set true only to enforce six attempts per app installation and one per specific artwork slot per UTC day. The global Neuron guard remains active either way."
       },
       "ALLOWED_ORIGINS": {
         "description": "Leave blank for Android-only use. This is not an authentication setting."

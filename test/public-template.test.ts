@@ -5,6 +5,7 @@ type PublicWranglerConfig = {
   account_id?: string;
   d1_databases?: Array<{ binding?: string; database_id?: string; database_name?: string }>;
   secrets?: { required?: string[] };
+  triggers?: { crons?: string[] };
   vars?: Record<string, string>;
 };
 
@@ -65,6 +66,14 @@ describe("public Cloudflare template", () => {
     expect(packageJson.scripts?.["db:migrate"]).toBe(
       "wrangler d1 migrations apply QUOTA_DB --remote",
     );
+    expect(config.triggers?.crons).toEqual(["17 4 * * *"]);
+    expect(config.vars?.ENFORCE_INSTALLATION_DAILY_CAPS).toBe("false");
+    const quotaMigration = readFileSync(
+      new URL("../migrations/0003_installation_artwork_quota.sql", import.meta.url),
+      "utf8",
+    );
+    expect(quotaMigration).toContain("daily_installation_artwork_slots");
+    expect(quotaMigration).toContain("WHERE legacy.day_utc = date('now')");
   });
 
   it("explains every value shown by the guided deployment", () => {
@@ -72,6 +81,7 @@ describe("public Cloudflare template", () => {
       "RATE_LIMIT_HASH_PEPPER",
       "REPORT_TOKEN_SECRET",
       "DAILY_GLOBAL_NEURON_BUDGET",
+      "ENFORCE_INSTALLATION_DAILY_CAPS",
       "ALLOWED_ORIGINS",
       "ENABLED_MODELS",
       "SAFETY_MODEL",

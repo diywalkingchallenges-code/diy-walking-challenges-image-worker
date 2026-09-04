@@ -18,8 +18,11 @@ import {
 } from "./prompt";
 import { classifyCloudflareAiError } from "./provider-errors";
 import {
-  MODEL_DAILY_ATTEMPT_LIMIT,
+  ARTWORK_SLOT_DAILY_ATTEMPT_LIMIT,
+  INSTALLATION_DAILY_ATTEMPT_LIMIT,
+  parseBooleanFlag,
   parsePositiveLimit,
+  pruneExpiredDailyQuota,
   reserveGenerationBudget,
   secondsUntilNextUtcDay,
 } from "./quota";
@@ -39,6 +42,7 @@ const MAX_REPORT_BODY_BYTES = 8 * 1024;
 const MAX_REFERENCE_BYTES = 2 * 1024 * 1024;
 const MAX_REFERENCE_BASE64_CHARACTERS = Math.ceil(MAX_REFERENCE_BYTES / 3) * 4 + 4;
 const INSTALLATION_ID_PATTERN = /^[A-Za-z0-9._-]{20,80}$/u;
+const ARTWORK_SLOT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,159}$/u;
 
 type ErrorCode =
   | "content_rejected"
@@ -49,7 +53,8 @@ type ErrorCode =
   | "method_not_allowed"
   | "model_busy"
   | "model_configuration_error"
-  | "model_daily_limit_reached"
+  | "artwork_slot_daily_limit_reached"
+  | "installation_daily_limit_reached"
   | "model_invalid_output"
   | "model_timeout"
   | "model_unavailable"
@@ -121,9 +126,13 @@ function addCorsHeaders(headers: Headers, origin: string | undefined): void {
       "Retry-After",
       "X-DIYWC-Estimated-Neurons",
       "X-DIYWC-Asset-Kind",
+      "X-DIYWC-Artwork-Slot-Attempts-Remaining",
+      "X-DIYWC-Artwork-Slot-Attempts-Used",
       "X-DIYWC-Global-Estimated-Neurons-Remaining",
       "X-DIYWC-Global-Estimated-Neurons-Used",
       "X-DIYWC-Height",
+      "X-DIYWC-Installation-Attempts-Remaining",
+      "X-DIYWC-Installation-Attempts-Used",
       "X-DIYWC-Model",
       "X-DIYWC-Model-Attempts-Remaining",
       "X-DIYWC-Model-Attempts-Used",
@@ -355,6 +364,17 @@ function parseGenerationRequest(body: unknown, enabledConfig: string | undefined
       "That image model is not available for the selected artwork type",
     );
   }
+  let artworkSlotId: string | undefined;
+  if (value.artworkSlotId !== undefined) {
+    if (typeof value.artworkSlotId !== "string" || !ARTWORK_SLOT_ID_PATTERN.test(value.artworkSlotId)) {
+      throw new ApiError(
+        400,
+        "invalid_request",
+        "Artwork slot ID must be 8–160 letters, numbers, periods, underscores, colons, or hyphens",
+      );
+    }
+    artworkSlotId = value.artworkSlotId;
+  }
   if (typeof value.prompt !== "string") {
     throw new ApiError(400, "invalid_prompt", "Describe the artwork you want to create");
   }
@@ -390,6 +410,7 @@ function parseGenerationRequest(body: unknown, enabledConfig: string | undefined
   }
   return {
     assetKind: assetKindValue,
+    ...(artworkSlotId ? { artworkSlotId } : {}),
     model: value.model as string,
     userPrompt,
     ...(seed === undefined ? {} : { seed }),
@@ -456,15 +477,31 @@ async function handleGenerate(
   const safetyNeurons = estimateSafetyNeurons(parsed.userPrompt);
   const estimatedNeurons = safetyNeurons + model.estimateImageNeurons(asset, parsed.reference);
   const globalNeuronBudget = parsePositiveLimit(env.DAILY_GLOBAL_NEURON_BUDGET, 10_000);
+  const enforceInstallationDailyCaps = parseBooleanFlag(
+    env.ENFORCE_INSTALLATION_DAILY_CAPS,
+    true,
+  );
+  // Older app builds omit artworkSlotId. They share one conservative legacy
+  // slot per artwork kind instead of receiving an accidental quota bypass.
+  const artworkSlotHash = await hashRateLimitKey(
+    "artwork-slot",
+    `${installationHash}\n${parsed.assetKind}\n${parsed.artworkSlotId ?? `legacy:${parsed.assetKind}`}`,
+    pepper,
+  );
   const retryAfter = secondsUntilNextUtcDay();
   let reservation: Awaited<ReturnType<typeof reserveGenerationBudget>>;
   try {
     reservation = await reserveGenerationBudget(
       env.QUOTA_DB,
-      installationHash,
-      model.alias,
-      estimatedNeurons,
-      globalNeuronBudget,
+      {
+        installationHash,
+        artworkSlotHash,
+        reservationId: requestId,
+        assetKind: parsed.assetKind,
+        estimatedNeurons,
+        globalNeuronBudget,
+        enforceInstallationDailyCaps,
+      },
     );
   } catch {
     throw new ApiError(
@@ -475,11 +512,20 @@ async function handleGenerate(
       60,
     );
   }
-  if (reservation.result === "model_exhausted") {
+  if (reservation.result === "installation_exhausted") {
     throw new ApiError(
       429,
-      "model_daily_limit_reached",
-      `This device has used today's ${MODEL_DAILY_ATTEMPT_LIMIT} attempts for ${model.name}. Try another available model, come back tomorrow, or upload your own artwork.`,
+      "installation_daily_limit_reached",
+      `This app installation has used today's ${INSTALLATION_DAILY_ATTEMPT_LIMIT} shared-server image attempts. Try again after the 00:00 UTC daily reset, use a private image server, or upload your own artwork.`,
+      true,
+      retryAfter,
+    );
+  }
+  if (reservation.result === "artwork_slot_exhausted") {
+    throw new ApiError(
+      429,
+      "artwork_slot_daily_limit_reached",
+      "This artwork already used its shared-server generation attempt today. Try again after the 00:00 UTC daily reset, use a private image server, or upload your own artwork.",
       true,
       retryAfter,
     );
@@ -588,8 +634,21 @@ async function handleGenerate(
   headers.set("X-DIYWC-SHA256", sha);
   headers.set("X-DIYWC-Width", String(image.width));
   headers.set("X-DIYWC-Height", String(image.height));
-  headers.set("X-DIYWC-Model-Attempts-Used", String(reservation.modelAttempts.used));
-  headers.set("X-DIYWC-Model-Attempts-Remaining", String(reservation.modelAttempts.remaining));
+  if (reservation.installationAttempts && reservation.artworkSlotAttempts) {
+    // The legacy names retain parser compatibility but now report the
+    // across-model installation cap; the additive names are unambiguous.
+    headers.set("X-DIYWC-Model-Attempts-Used", String(reservation.installationAttempts.used));
+    headers.set("X-DIYWC-Model-Attempts-Remaining", String(reservation.installationAttempts.remaining));
+    headers.set("X-DIYWC-Installation-Attempts-Used", String(reservation.installationAttempts.used));
+    headers.set("X-DIYWC-Installation-Attempts-Remaining", String(reservation.installationAttempts.remaining));
+    headers.set("X-DIYWC-Artwork-Slot-Attempts-Used", String(reservation.artworkSlotAttempts.used));
+    headers.set("X-DIYWC-Artwork-Slot-Attempts-Remaining", String(reservation.artworkSlotAttempts.remaining));
+  } else {
+    // Old clients require these integer headers. In uncapped mode they are a
+    // compatibility sentinel only; the catalog's enforcement flag is authoritative.
+    headers.set("X-DIYWC-Model-Attempts-Used", "0");
+    headers.set("X-DIYWC-Model-Attempts-Remaining", String(INSTALLATION_DAILY_ATTEMPT_LIMIT));
+  }
   headers.set("X-DIYWC-Estimated-Neurons", String(reservation.estimatedNeurons));
   headers.set(
     "X-DIYWC-Global-Estimated-Neurons-Used",
@@ -673,6 +732,10 @@ async function dispatch(
   }
   if (url.pathname === "/v1/models") {
     if (request.method !== "GET") throw new ApiError(405, "method_not_allowed", "Method not allowed");
+    const installationDailyCapsEnforced = parseBooleanFlag(
+      env.ENFORCE_INSTALLATION_DAILY_CAPS,
+      true,
+    );
     return jsonResponse(
       {
         apiVersion: API_VERSION,
@@ -682,8 +745,12 @@ async function dispatch(
           maxCodePoints: MAX_USER_PROMPT_CODE_POINTS,
         },
         quota: {
-          dailyAttemptLimit: MODEL_DAILY_ATTEMPT_LIMIT,
-          dailyAttemptScope: "installation_model",
+          dailyAttemptLimit: INSTALLATION_DAILY_ATTEMPT_LIMIT,
+          dailyAttemptScope: "installation",
+          installationDailyCapsEnforced,
+          artworkSlotDailyAttemptLimit: ARTWORK_SLOT_DAILY_ATTEMPT_LIMIT,
+          artworkSlotIdSupported: true,
+          legacyMissingArtworkSlotScope: "installation_asset_kind",
           resets: "utc_day",
         },
         models: enabledModelSpecs(env.ENABLED_MODELS).map((model) => {
@@ -694,7 +761,7 @@ async function dispatch(
             name: model.name,
             description: model.description,
             supportsReference: model.supportsReference,
-            dailyAttemptLimit: MODEL_DAILY_ATTEMPT_LIMIT,
+            dailyAttemptLimit: INSTALLATION_DAILY_ATTEMPT_LIMIT,
             baseEstimatedImageNeurons: medal.baseEstimatedImageNeurons,
             output: medal.output,
             ...(model.supportsReference
@@ -759,5 +826,8 @@ export default {
             );
       return errorResponse(apiError, requestId, origin);
     }
+  },
+  async scheduled(_controller: ScheduledController, env: Env): Promise<void> {
+    await pruneExpiredDailyQuota(env.QUOTA_DB);
   },
 };
