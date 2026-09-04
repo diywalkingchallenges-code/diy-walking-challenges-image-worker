@@ -49,6 +49,7 @@ function base64(bytes: Uint8Array): string {
 type MockDatabaseOptions = {
   diagnosticPersistenceFailure?: boolean;
   globalBudgetExhausted?: boolean;
+  globalBudgetUsed?: number;
   modelAttemptsExhausted?: boolean;
 };
 
@@ -61,6 +62,11 @@ function mockDatabase(options: MockDatabaseOptions = {}): D1Database {
             return options.modelAttemptsExhausted ? null : { attempts: 1 };
           }
           if (sql.includes("daily_global_neuron_budget")) {
+            if (sql.trimStart().startsWith("SELECT")) {
+              return options.globalBudgetUsed === undefined
+                ? null
+                : { estimated_neurons_used: options.globalBudgetUsed };
+            }
             return options.globalBudgetExhausted
               ? null
               : { estimated_neurons_used: Number(values[1]) };
@@ -68,6 +74,7 @@ function mockDatabase(options: MockDatabaseOptions = {}): D1Database {
           if (sql.includes("generation_reports")) return { report_id: String(values[0]) };
           return null;
         }),
+        run: vi.fn(async () => ({ success: true })),
       })),
     })),
     batch: vi.fn(async (statements: D1PreparedStatement[]) => {
@@ -499,6 +506,144 @@ describe("daily budget policy", () => {
       "2026-09-03T12:00:00.000Z",
       3,
     ]);
+    expect(binds[1]).toEqual([
+      "2026-09-03",
+      153,
+      "2026-09-03T12:00:00.000Z",
+      8_000,
+    ]);
+  });
+
+  it("enforces the global cap when the day's counter does not exist yet", async () => {
+    const statements: string[] = [];
+    let modelAttempts = 0;
+    const db = {
+      prepare: vi.fn((sql: string) => {
+        statements.push(sql);
+        return {
+          bind: vi.fn((...values: unknown[]) => ({
+            first: vi.fn(async () => {
+              if (sql.includes("daily_installation_model_attempts")) {
+                modelAttempts += 1;
+                return { attempts: modelAttempts };
+              }
+              if (sql.trimStart().startsWith("SELECT")) return null;
+              if (sql.includes("daily_global_neuron_budget")) {
+                return Number(values[1]) <= Number(values[3])
+                  ? { estimated_neurons_used: Number(values[1]) }
+                  : null;
+              }
+              return null;
+            }),
+            run: vi.fn(async () => {
+              if (sql.includes("daily_installation_model_attempts")) {
+                modelAttempts = Math.max(0, modelAttempts - 1);
+              }
+              return { success: true };
+            }),
+          })),
+        };
+      }),
+    } as unknown as D1Database;
+
+    const result = await reserveGenerationBudget(
+      db,
+      "hashed-installation",
+      "flux-schnell",
+      10_001,
+      10_000,
+      new Date("2026-09-03T12:00:00Z"),
+    );
+
+    expect(result).toEqual({
+      result: "global_exhausted",
+      globalNeurons: { used: 0, remaining: 10_000 },
+      estimatedNeurons: 10_001,
+    });
+    expect(modelAttempts).toBe(0);
+    expect(statements.find((sql) => sql.includes("daily_global_neuron_budget")))
+      .toMatch(/SELECT \?1, \?2, 1, \?3\s+WHERE \?2 <= \?4/u);
+  });
+
+  it("does not consume a model attempt when the shared budget cannot fit the request", async () => {
+    let modelAttempts = 0;
+    const db = {
+      prepare: vi.fn((sql: string) => ({
+        bind: vi.fn((...values: unknown[]) => ({
+          first: vi.fn(async () => {
+            if (sql.includes("daily_installation_model_attempts")) {
+              modelAttempts += 1;
+              return { attempts: modelAttempts };
+            }
+            if (sql.trimStart().startsWith("SELECT")) {
+              return { estimated_neurons_used: 9_950 };
+            }
+            if (sql.includes("daily_global_neuron_budget")) return null;
+            return null;
+          }),
+          run: vi.fn(async () => {
+            if (sql.includes("daily_installation_model_attempts")) {
+              modelAttempts = Math.max(0, modelAttempts - 1);
+            }
+            return { success: true };
+          }),
+        })),
+      })),
+    } as unknown as D1Database;
+
+    const result = await reserveGenerationBudget(
+      db,
+      "hashed-installation",
+      "flux-schnell",
+      100,
+      10_000,
+      new Date("2026-09-03T12:00:00Z"),
+    );
+
+    expect(result).toEqual({
+      result: "global_exhausted",
+      globalNeurons: { used: 9_950, remaining: 50 },
+      estimatedNeurons: 100,
+    });
+    expect(modelAttempts).toBe(0);
+  });
+
+  it("rolls back a model attempt when the shared budget write fails", async () => {
+    let modelAttempts = 0;
+    const db = {
+      prepare: vi.fn((sql: string) => ({
+        bind: vi.fn(() => ({
+          first: vi.fn(async () => {
+            if (sql.includes("daily_installation_model_attempts")) {
+              modelAttempts += 1;
+              return { attempts: modelAttempts };
+            }
+            if (sql.includes("daily_global_neuron_budget")) {
+              throw new Error("D1 temporarily unavailable");
+            }
+            return null;
+          }),
+          run: vi.fn(async () => {
+            if (sql.includes("daily_installation_model_attempts")) {
+              modelAttempts = Math.max(0, modelAttempts - 1);
+            }
+            return { success: true };
+          }),
+        })),
+      })),
+    } as unknown as D1Database;
+
+    await expect(
+      reserveGenerationBudget(
+        db,
+        "hashed-installation",
+        "flux-schnell",
+        100,
+        10_000,
+        new Date("2026-09-03T12:00:00Z"),
+      ),
+    ).rejects.toThrow("D1 temporarily unavailable");
+    expect(modelAttempts).toBe(0);
   });
 
   it("shares a model's three daily attempts across all of its artwork types", async () => {
@@ -515,11 +660,20 @@ describe("daily budget policy", () => {
               attempts += 1;
               return { attempts };
             }
+            if (sql.trimStart().startsWith("SELECT")) {
+              return { estimated_neurons_used: globalNeurons };
+            }
             if (sql.includes("daily_global_neuron_budget")) {
               globalNeurons += Number(values[1]);
               return { estimated_neurons_used: globalNeurons };
             }
             return null;
+          }),
+          run: vi.fn(async () => {
+            if (sql.includes("daily_global_neuron_budget")) {
+              globalNeurons = Math.max(0, globalNeurons - Number(values[1]));
+            }
+            return { success: true };
           }),
         })),
       })),
@@ -944,15 +1098,28 @@ describe("POST /v1/generate", () => {
     await expect(response.json()).resolves.toMatchObject({ error: { code: "rate_limited" } });
   });
 
-  it("fails closed with a clear 503 when the global daily cap is exhausted", async () => {
+  it("reports the requested and remaining Neurons when the global daily cap cannot fit an image", async () => {
+    const prompt = "a medal";
+    const requestedNeurons = 58 + estimateSafetyNeurons(prompt);
+    const db = mockDatabase({ globalBudgetExhausted: true, globalBudgetUsed: 9_950 });
     const response = await worker.fetch(
-      postGenerate({ model: "flux-schnell", prompt: "a medal" }),
-      mockEnv({}, { globalBudgetExhausted: true }),
+      postGenerate({ model: "flux-schnell", prompt }),
+      mockEnv({ QUOTA_DB: db, DAILY_GLOBAL_NEURON_BUDGET: "10000" }),
     );
     expect(response.status).toBe(503);
     await expect(response.json()).resolves.toMatchObject({
-      error: { code: "daily_quota_exhausted", retryable: true },
+      error: {
+        code: "daily_quota_exhausted",
+        message: `Today's shared server allowance has 50 estimated Neurons left, but this image needs ${requestedNeurons}. Try again after the 00:00 UTC daily reset or upload your own artwork.`,
+        retryable: true,
+        requestedNeurons,
+        usedNeurons: 9_950,
+        remainingNeurons: 50,
+      },
     });
+    expect(response.headers.get("X-DIYWC-Estimated-Neurons")).toBe(String(requestedNeurons));
+    expect(response.headers.get("X-DIYWC-Global-Estimated-Neurons-Used")).toBe("9950");
+    expect(response.headers.get("X-DIYWC-Global-Estimated-Neurons-Remaining")).toBe("50");
   });
 
   it("returns a distinct daily-limit error after three attempts for this model", async () => {

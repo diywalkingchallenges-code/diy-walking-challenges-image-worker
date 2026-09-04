@@ -224,7 +224,7 @@ X-DIYWC-Model-Attempts-Used: 1
 X-DIYWC-Model-Attempts-Remaining: 2
 X-DIYWC-Estimated-Neurons: 145
 X-DIYWC-Global-Estimated-Neurons-Used: 145
-X-DIYWC-Global-Estimated-Neurons-Remaining: 7855
+X-DIYWC-Global-Estimated-Neurons-Remaining: 9855
 ```
 
 Before image inference, the server submits the sanitized user prompt—not the hidden parent prompt—to
@@ -236,14 +236,21 @@ Each installation receives exactly three attempts per model per UTC day. Artwork
 model counter: three mixed Klein requests are three Klein attempts, not three attempts per kind. The
 backend also makes an exact D1 reservation against a separate global conservative estimated-Neuron
 budget. The estimate includes variable Llama Guard headroom and the selected image output/reference
-tiles; it is not Cloudflare's authoritative bill. The attempt and global estimate are reserved before
-classification/inference and are not refunded after rejection, cancellation, timeout, or upstream
-failure.
+tiles; it is not Cloudflare's authoritative bill. The model attempt is released when the global
+budget cannot fit the request or when that reservation fails. After a successful global reservation,
+the attempt and estimate are not refunded for classification rejection, cancellation, timeout, or
+upstream failure.
 
 The service does not save generated images. Generation is intentionally non-idempotent: the Android
 client should generate only after an explicit tap and must not automatically retry an ambiguous
 timeout. Canceling the download does not guarantee that already-started classification or inference
 is canceled, and the reserved quota remains consumed.
+
+If an image does not fit in the remaining shared daily budget, `daily_quota_exhausted` reports the
+estimated request cost and the current estimated usage and remainder in both JSON and the
+`X-DIYWC-Estimated-Neurons`, `X-DIYWC-Global-Estimated-Neurons-Used`, and
+`X-DIYWC-Global-Estimated-Neurons-Remaining` headers. That rejection restores the installation's
+model attempt because classification and image inference never started.
 
 When image inference fails, the Worker normalizes only Cloudflare's numeric internal error code and
 category. It never returns or records the provider's raw message or stack. D1 records only the
@@ -303,6 +310,10 @@ Errors are JSON and always include a correlation ID:
   }
 }
 ```
+
+A shared-budget rejection additionally includes `requestedNeurons`, `usedNeurons`, and
+`remainingNeurons`, so clients can explain that a particular image no longer fits without falsely
+claiming that no allowance remains.
 
 Expected codes include `invalid_request`, `invalid_prompt`, `model_unavailable`, `content_rejected`,
 `model_busy`, `workers_ai_quota_exhausted`, `model_timeout`, `model_configuration_error`,

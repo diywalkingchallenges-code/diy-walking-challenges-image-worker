@@ -52,7 +52,8 @@ async function reserveGlobalNeuronBudget(
     .prepare(
       `INSERT INTO daily_global_neuron_budget
          (day_utc, estimated_neurons_used, attempts, updated_at)
-       VALUES (?1, ?2, 1, ?3)
+       SELECT ?1, ?2, 1, ?3
+       WHERE ?2 <= ?4
        ON CONFLICT(day_utc) DO UPDATE SET
          estimated_neurons_used = estimated_neurons_used + excluded.estimated_neurons_used,
          attempts = attempts + 1,
@@ -65,6 +66,41 @@ async function reserveGlobalNeuronBudget(
   return row
     ? { used: row.estimated_neurons_used, remaining: cap - row.estimated_neurons_used }
     : null;
+}
+
+async function readGlobalNeuronBudget(
+  db: D1Database,
+  day: string,
+  cap: number,
+): Promise<CounterReservation> {
+  const row = await db
+    .prepare(
+      `SELECT estimated_neurons_used
+       FROM daily_global_neuron_budget
+       WHERE day_utc = ?1`,
+    )
+    .bind(day)
+    .first<NeuronRow>();
+  const used = row?.estimated_neurons_used ?? 0;
+  return { used, remaining: Math.max(0, cap - used) };
+}
+
+async function releaseInstallationModelAttempt(
+  db: D1Database,
+  day: string,
+  installationHash: string,
+  modelAlias: string,
+): Promise<void> {
+  await db
+    .prepare(
+      `UPDATE daily_installation_model_attempts
+       SET attempts = MAX(0, attempts - 1)
+       WHERE day_utc = ?1
+         AND installation_hash = ?2
+         AND model_alias = ?3`,
+    )
+    .bind(day, installationHash, modelAlias)
+    .run();
 }
 
 export async function reserveGenerationBudget(
@@ -82,7 +118,11 @@ export async function reserveGenerationBudget(
       estimatedNeurons: number;
     }
   | { result: "model_exhausted" }
-  | { result: "global_exhausted" }
+  | {
+      result: "global_exhausted";
+      globalNeurons: CounterReservation;
+      estimatedNeurons: number;
+    }
 > {
   if (!Number.isSafeInteger(estimatedNeurons) || estimatedNeurons < 1) {
     throw new Error("Invalid estimated Neuron reservation");
@@ -98,16 +138,31 @@ export async function reserveGenerationBudget(
   );
   if (!modelAttempts) return { result: "model_exhausted" };
 
-  const globalNeurons = await reserveGlobalNeuronBudget(
-    db,
-    day,
-    estimatedNeurons,
-    globalNeuronBudget,
-    now,
-  );
-  return globalNeurons
-    ? { result: "reserved", modelAttempts, globalNeurons, estimatedNeurons }
-    : { result: "global_exhausted" };
+  let globalNeurons: CounterReservation | null;
+  try {
+    globalNeurons = await reserveGlobalNeuronBudget(
+      db,
+      day,
+      estimatedNeurons,
+      globalNeuronBudget,
+      now,
+    );
+  } catch (error) {
+    // A D1 failure after the model attempt was reserved must not silently use
+    // up one of that installation's three attempts.
+    await releaseInstallationModelAttempt(db, day, installationHash, modelAlias);
+    throw error;
+  }
+  if (!globalNeurons) {
+    await releaseInstallationModelAttempt(db, day, installationHash, modelAlias);
+    return {
+      result: "global_exhausted",
+      globalNeurons: await readGlobalNeuronBudget(db, day, globalNeuronBudget),
+      estimatedNeurons,
+    };
+  }
+
+  return { result: "reserved", modelAttempts, globalNeurons, estimatedNeurons };
 }
 
 export function secondsUntilNextUtcDay(instant = new Date()): number {

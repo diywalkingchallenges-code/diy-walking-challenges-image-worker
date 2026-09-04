@@ -41,7 +41,7 @@
         "description": "A second, different private code used to verify image reports. Generate a new random value of at least 32 characters."
       },
       "DAILY_GLOBAL_NEURON_BUDGET": {
-        "description": "The Worker's conservative daily image-generation budget. Keep 1000 for a cautious personal server."
+        "description": "The Worker's conservative daily image-generation budget. The reviewed 10000 default matches Cloudflare's currently documented free daily Workers AI allocation; limits can change."
       },
       "ALLOWED_ORIGINS": {
         "description": "Leave blank for Android-only use. This is not an authentication setting."
