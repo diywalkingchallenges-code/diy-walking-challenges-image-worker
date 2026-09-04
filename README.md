@@ -8,6 +8,10 @@ The Android app works without this service. People can always upload their own a
 
 [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/diywalkingchallenges-code/diy-walking-challenges-image-worker)
 
+**This setup is available now.** The button opens Cloudflare's guided deployment screen; it is not
+a placeholder or a wait-list. You still need to sign in, choose names, supply two private random
+codes, and confirm **Deploy**. Cloudflare handles the repository copy and resource provisioning.
+
 ## What the setup button does
 
 Cloudflare copies this public template into **your** GitHub account, creates the resources in **your**
@@ -107,10 +111,13 @@ Requirements: Node.js 22 or newer and a Cloudflare account for live development.
 npm ci
 npm run check
 npm test
+npm run template:check
 ```
 
 Tests use fake AI, D1, and rate-limiter bindings. They do not send prompts or images to Cloudflare
-and do not consume Workers AI allowance.
+and do not consume Workers AI allowance. `template:check` also performs a local dry-run of the exact
+Worker bundle and bindings used by the Deploy to Cloudflare flow; it does not contact Workers AI or
+create Cloudflare resources.
 
 For local Worker development, copy `.dev.vars.example` to `.dev.vars`, replace both examples with
 different random values of at least 32 characters, and run `npm run dev`. `.dev.vars` is ignored by

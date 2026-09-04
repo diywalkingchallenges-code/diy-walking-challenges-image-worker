@@ -16,6 +16,9 @@ uploaded artwork and its built-in non-AI medal design.
 
 ## The easiest setup
 
+This guided setup is live now. The button is Cloudflare's official deployment flow, not a future
+feature. It provisions the required resources after you review the fields and select **Deploy**.
+
 1. Select the button below.
 
    [![Deploy to Cloudflare](https://deploy.workers.cloudflare.com/button)](https://deploy.workers.cloudflare.com/?url=https://github.com/diywalkingchallenges-code/diy-walking-challenges-image-worker)

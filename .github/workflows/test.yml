@@ -30,5 +30,8 @@ jobs:
       - name: Run tests
         run: npm test
 
+      - name: Validate Deploy to Cloudflare template
+        run: npm run template:check
+
       - name: Check production dependencies
         run: npm audit --omit=dev --audit-level=high
