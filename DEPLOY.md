@@ -126,6 +126,15 @@ another path.
 Wait for the UTC-day reset or upload artwork from the phone. Do not repeatedly retry; failed or
 ambiguous attempts are intentionally not refunded.
 
+### An image model is busy, times out, or rejects a harmless description
+
+Use the request ID shown by the app to find the matching `provider_ai_failures` row in D1. The row's
+normalized code and category distinguish a content-filter decision, temporary capacity, account
+allowance, timeout, configuration/access problem, invalid output, or unknown fallback without
+retaining the description or raw Cloudflare error. Rows older than 30 days are removed on later
+failure writes, and the table is capped at 5,000 rows. Structured Worker logs contain the same safe
+fields but are secondary and may be sampled.
+
 ### Cloudflare reports a missing secret
 
 Open the Worker in Cloudflare, then **Settings → Variables and Secrets**. Add the exact missing name
@@ -136,7 +145,8 @@ at least 32 characters.
 ### The database tables are missing
 
 From the GitHub-connected Cloudflare build settings, confirm the deploy command is `npm run deploy`.
-That command applies `migrations/0001_daily_quota.sql` before deploying the Worker.
+That command applies every pending migration, including the quota/report tables and the minimal
+provider-failure diagnostics table, before deploying the Worker.
 
 Never solve a setup error by publishing a private code, Cloudflare API token, database ID, or account
 ID in an issue. Use a [private GitHub security advisory](SECURITY.md) if the problem exposes sensitive

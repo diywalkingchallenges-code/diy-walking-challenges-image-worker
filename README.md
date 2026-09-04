@@ -23,7 +23,7 @@ The deployment contains:
 
 - one Cloudflare Worker that validates requests and returns generated images;
 - one Workers AI connection for image generation and text safety screening;
-- one small D1 database for daily limits and image reports; and
+- one small D1 database for daily limits, image reports, and privacy-minimal failure diagnostics; and
 - three short-window rate limiters to reduce accidental or abusive bursts.
 
 No DIY Walking Challenges account, Firebase project, or payment information is required by this
@@ -64,7 +64,11 @@ route progress, race-room data, account profiles, or advertising data.
 The D1 database stores daily usage counters keyed by salted hashes. If a user reports a generated
 image, it stores the request ID, hashed installation ID, report reason, optional report details, and
 timestamps. Report details are free-form, so clients should warn people not to type personal or
-sensitive information there. See [API.md](API.md) for the exact wire contract and
+sensitive information there. When Cloudflare image inference fails, D1 stores only the request ID,
+model alias, artwork type, normalized provider code/category, and timestamp. It stores no prompt,
+network address, installation identifier or hash, provider message, or stack for that diagnostic.
+Failure rows are pruned after 30 days on subsequent writes and capped at 5,000 rows. See
+[API.md](API.md) for the exact wire contract and
 [SECURITY.md](SECURITY.md) for the security model.
 
 ## Built-in safeguards
@@ -78,6 +82,8 @@ sensitive information there. See [API.md](API.md) for the exact wire contract an
   checks.
 - Generated files are bounded and validated for format and dimensions before being returned.
 - Exact daily attempt and conservative compute-budget reservations are stored in D1.
+- Provider failures become stable, plain-language API errors; raw upstream errors are never returned.
+- Minimal failure diagnostics exclude user content and use bounded D1 retention.
 - Browser access is denied by default; wildcard CORS is intentionally unsupported.
 - Responses are not cached, and the landing page has a restrictive security policy.
 
@@ -114,7 +120,8 @@ npm test
 npm run template:check
 ```
 
-Tests use fake AI, D1, and rate-limiter bindings. They do not send prompts or images to Cloudflare
+Tests use fake AI, D1, and rate-limiter bindings. They cover nested provider-code normalization,
+stable error mapping, bounded minimal diagnostics, and diagnostic-write failure. They do not send prompts or images to Cloudflare
 and do not consume Workers AI allowance. `template:check` also performs a local dry-run of the exact
 Worker bundle and bindings used by the Deploy to Cloudflare flow; it does not contact Workers AI or
 create Cloudflare resources.
@@ -125,7 +132,7 @@ Git and must never be committed.
 
 ## Repository map
 
-- `src/` — request validation, prompts, model allowlist, quotas, reports, and image validation
+- `src/` — request validation, prompts, model allowlist, quotas, reports, diagnostics, and image validation
 - `migrations/` — D1 database tables and indexes
 - `test/` — unit and API-contract tests with mocked Cloudflare bindings
 - `wrangler.jsonc` — portable, account-free Cloudflare resource declarations

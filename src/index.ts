@@ -1,4 +1,5 @@
 import { ImageValidationError, sha256Hex, validateGeneratedImage, validateReferenceImage } from "./images";
+import { recordProviderFailureDiagnostic } from "./failure-diagnostics";
 import {
   enabledModelSpecs,
   findEnabledModel,
@@ -15,6 +16,7 @@ import {
   MIN_USER_PROMPT_CODE_POINTS,
   sanitizeUserPrompt,
 } from "./prompt";
+import { classifyCloudflareAiError } from "./provider-errors";
 import {
   MODEL_DAILY_ATTEMPT_LIMIT,
   parsePositiveLimit,
@@ -45,12 +47,17 @@ type ErrorCode =
   | "invalid_report_token"
   | "invalid_request"
   | "method_not_allowed"
+  | "model_busy"
+  | "model_configuration_error"
   | "model_daily_limit_reached"
+  | "model_invalid_output"
+  | "model_timeout"
   | "model_unavailable"
   | "not_found"
   | "origin_not_allowed"
   | "rate_limited"
-  | "service_unavailable";
+  | "service_unavailable"
+  | "workers_ai_quota_exhausted";
 
 class ApiError extends Error {
   constructor(
@@ -404,24 +411,6 @@ async function applyGenerationBurstLimits(
   return installationHash;
 }
 
-function classifyModelError(error: unknown): ApiError {
-  const message = error instanceof Error ? error.message : String(error);
-  if (/safety|moderation|inappropriate|nsfw|content.?policy/iu.test(message)) {
-    return new ApiError(
-      422,
-      "content_rejected",
-      "That image could not be generated. Try a different, family-friendly description.",
-    );
-  }
-  return new ApiError(
-    503,
-    "model_unavailable",
-    "Image generation is temporarily unavailable. You can still upload your own artwork.",
-    true,
-    120,
-  );
-}
-
 async function handleGenerate(
   request: Request,
   env: Env,
@@ -519,7 +508,21 @@ async function handleGenerate(
       parsed.reference,
     );
   } catch (error) {
-    throw classifyModelError(error);
+    const failure = classifyCloudflareAiError(error, retryAfter);
+    await recordProviderFailureDiagnostic(env.QUOTA_DB, {
+      requestId,
+      modelAlias: model.alias,
+      assetKind: parsed.assetKind,
+      providerCode: failure.providerCode,
+      category: failure.category,
+    });
+    throw new ApiError(
+      failure.api.status,
+      failure.api.code,
+      failure.api.message,
+      failure.api.retryable,
+      failure.api.retryAfterSeconds,
+    );
   }
   let image;
   try {
@@ -528,10 +531,17 @@ async function handleGenerate(
       asset.output.providerControlled ? undefined : asset.output,
     );
   } catch {
+    await recordProviderFailureDiagnostic(env.QUOTA_DB, {
+      requestId,
+      modelAlias: model.alias,
+      assetKind: parsed.assetKind,
+      providerCode: "unknown",
+      category: "invalid_output",
+    });
     throw new ApiError(
       503,
-      "model_unavailable",
-      "The image service returned an unusable result. Try again or upload your own artwork.",
+      "model_invalid_output",
+      "The image model returned an unusable image. Try again or upload your own artwork.",
       true,
       120,
     );

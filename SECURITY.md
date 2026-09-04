@@ -44,6 +44,10 @@ issued report tokens.
 - Text safety screening does not inspect reference-image or generated-image pixels.
 - CORS controls browser origins; it does not authenticate native apps.
 - The Worker does not currently verify Play Integrity or Firebase App Check tokens.
+- Image-inference diagnostics contain only a request ID, model alias, artwork type, normalized
+  provider code/category, and timestamp. D1 prunes them after 30 days on subsequent writes and caps
+  them at 5,000 rows. Prompts, images, IPs, installation IDs/hashes, and raw provider messages or
+  stacks must never be added to diagnostics or logs.
 
 Before exposing one deployment to broad public traffic, add properly verified app attestation,
 operational alerts, report-review and retention procedures, image-input/output moderation suitable
