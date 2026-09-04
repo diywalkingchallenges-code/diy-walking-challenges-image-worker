@@ -101,9 +101,13 @@ The checked-in production allowlist exposes two inexpensive model adapters:
 | `flux2-klein-4b` | `@cf/black-forest-labs/flux-2-klein-4b` | Medals, banners, route maps, optional references |
 
 Each app installation gets three attempts per enabled model per UTC day. All artwork types made with
-one model share those three attempts. The default `DAILY_GLOBAL_NEURON_BUDGET` is `1000`, which is a
-conservative application-level stop below Cloudflare's account-wide allowance. It is not
-Cloudflare's authoritative meter or a guaranteed billing cap.
+one model share those three attempts. The default `DAILY_GLOBAL_NEURON_BUDGET` is `10000`, matching
+the free daily Workers AI allocation Cloudflare currently documents. Everyone using this Worker
+shares that account allowance, which resets at 00:00 UTC. A personal Worker has its own allowance
+instead of drawing from the DIY Walking Challenges hosted shared server. The internal counter is a
+conservative estimate, not Cloudflare's authoritative meter or a promise that every one of those
+10,000 Neurons will remain available; Cloudflare can change its policies and other Workers AI use
+on the same account also counts.
 
 Several additional adapters remain in the source with `productionEnabled: false`. Editing only the
 environment variable cannot expose them. Enabling another model requires a code change, tests, and a

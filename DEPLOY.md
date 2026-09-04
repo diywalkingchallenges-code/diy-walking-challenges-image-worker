@@ -36,9 +36,9 @@ feature. It provisions the required resources after you review the fields and se
 5. When it asks for `REPORT_TOKEN_SECRET`, generate a different random value of at least 32
    characters. This is the **report private code**. Do not reuse the first value.
 
-6. Keep these cautious defaults:
+6. Keep these reviewed defaults:
 
-   - `DAILY_GLOBAL_NEURON_BUDGET`: `1000`
+   - `DAILY_GLOBAL_NEURON_BUDGET`: `10000`
    - `ENABLED_MODELS`: `flux2-klein-4b,flux-schnell`
    - `SAFETY_MODEL`: `@cf/meta/llama-guard-3-8b`
    - `ALLOWED_ORIGINS`: leave empty for the Android app
@@ -58,15 +58,18 @@ login, Cloudflare account ID, D1 database ID, and API tokens must stay out of th
 
 ## What could cost money?
 
-Cloudflare currently documents a daily free Workers AI allowance. On the Free plan, work stops when
-the allowance is exhausted instead of automatically creating Workers AI overage charges. A paid
+Cloudflare currently documents a 10,000-Neuron daily free Workers AI allowance, resetting at 00:00
+UTC. On the Free plan, work stops when the allowance is exhausted instead of automatically creating Workers AI overage charges. A paid
 Workers plan can charge for usage above its included allowance, and other Cloudflare products may
 have separate pricing.
 
-The template's `1000`-Neuron internal daily budget is deliberately much smaller than the currently
-documented account-wide free allowance. It protects against ordinary use and some abuse, but it is
-an estimate made before generation—not a contractual spending cap. Cloudflare can change models,
-allowances, and pricing. Check the official pages before raising limits or choosing a paid plan:
+The template's `10000`-Neuron internal daily budget matches that currently documented allocation.
+Everyone using one deployed Worker shares its Cloudflare-account allowance; deploying a personal
+Worker gives that account its own allowance instead of drawing from the app's hosted shared server.
+The internal counter is an estimate made before generation—not Cloudflare's authoritative meter, a
+contractual spending cap, or a guarantee that all 10,000 Neurons will be available. Other Workers AI
+activity on the account also counts, and Cloudflare can change models, allowances, and pricing.
+Check the official pages before changing limits or choosing a paid plan:
 
 - [Workers AI pricing](https://developers.cloudflare.com/workers-ai/platform/pricing/)
 - [Workers platform pricing](https://developers.cloudflare.com/workers/platform/pricing/)

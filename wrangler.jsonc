@@ -52,7 +52,7 @@
 		}
 	],
 	"vars": {
-		"DAILY_GLOBAL_NEURON_BUDGET": "1000",
+		"DAILY_GLOBAL_NEURON_BUDGET": "10000",
 		"ALLOWED_ORIGINS": "",
 		"ENABLED_MODELS": "flux2-klein-4b,flux-schnell",
 		"SAFETY_MODEL": "@cf/meta/llama-guard-3-8b"

@@ -59,6 +59,12 @@ type ErrorCode =
   | "service_unavailable"
   | "workers_ai_quota_exhausted";
 
+type NeuronQuotaDetails = {
+  requested: number;
+  used: number;
+  remaining: number;
+};
+
 class ApiError extends Error {
   constructor(
     readonly status: number,
@@ -66,6 +72,7 @@ class ApiError extends Error {
     message: string,
     readonly retryable = false,
     readonly retryAfterSeconds?: number,
+    readonly neuronQuota?: NeuronQuotaDetails,
   ) {
     super(message);
   }
@@ -201,6 +208,11 @@ function errorResponse(error: ApiError, requestId: string, origin: string | unde
   if (error.retryAfterSeconds !== undefined) {
     extra.set("Retry-After", String(error.retryAfterSeconds));
   }
+  if (error.neuronQuota) {
+    extra.set("X-DIYWC-Estimated-Neurons", String(error.neuronQuota.requested));
+    extra.set("X-DIYWC-Global-Estimated-Neurons-Used", String(error.neuronQuota.used));
+    extra.set("X-DIYWC-Global-Estimated-Neurons-Remaining", String(error.neuronQuota.remaining));
+  }
   return jsonResponse(
     {
       error: {
@@ -211,6 +223,13 @@ function errorResponse(error: ApiError, requestId: string, origin: string | unde
         ...(error.retryAfterSeconds === undefined
           ? {}
           : { retryAfterSeconds: error.retryAfterSeconds }),
+        ...(error.neuronQuota === undefined
+          ? {}
+          : {
+              requestedNeurons: error.neuronQuota.requested,
+              usedNeurons: error.neuronQuota.used,
+              remainingNeurons: error.neuronQuota.remaining,
+            }),
       },
     },
     error.status,
@@ -436,7 +455,7 @@ async function handleGenerate(
 
   const safetyNeurons = estimateSafetyNeurons(parsed.userPrompt);
   const estimatedNeurons = safetyNeurons + model.estimateImageNeurons(asset, parsed.reference);
-  const globalNeuronBudget = parsePositiveLimit(env.DAILY_GLOBAL_NEURON_BUDGET, 8_000);
+  const globalNeuronBudget = parsePositiveLimit(env.DAILY_GLOBAL_NEURON_BUDGET, 10_000);
   const retryAfter = secondsUntilNextUtcDay();
   let reservation: Awaited<ReturnType<typeof reserveGenerationBudget>>;
   try {
@@ -466,12 +485,18 @@ async function handleGenerate(
     );
   }
   if (reservation.result === "global_exhausted") {
+    const quota = {
+      requested: reservation.estimatedNeurons,
+      used: reservation.globalNeurons.used,
+      remaining: reservation.globalNeurons.remaining,
+    };
     throw new ApiError(
       503,
       "daily_quota_exhausted",
-      "Today's shared image-generation allowance has been used. Try again tomorrow or upload your own artwork.",
+      `Today's shared server allowance has ${quota.remaining} estimated Neurons left, but this image needs ${quota.requested}. Try again after the 00:00 UTC daily reset or upload your own artwork.`,
       true,
       retryAfter,
+      quota,
     );
   }
 
