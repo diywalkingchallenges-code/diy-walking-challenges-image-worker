@@ -26,6 +26,7 @@
     "check": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "template:check": "wrangler deploy --dry-run --outdir .wrangler/template-check",
     "dev": "wrangler dev",
     "db:migrate": "wrangler d1 migrations apply QUOTA_DB --remote",
     "deploy:worker": "wrangler deploy",
@@ -44,6 +45,12 @@
       },
       "ALLOWED_ORIGINS": {
         "description": "Leave blank for Android-only use. This is not an authentication setting."
+      },
+      "ENABLED_MODELS": {
+        "description": "Keep `flux2-klein-4b,flux-schnell` for the two reviewed, inexpensive image models."
+      },
+      "SAFETY_MODEL": {
+        "description": "Keep `@cf/meta/llama-guard-3-8b`; the Worker uses it to screen each artwork description before image generation."
       }
     }
   },
