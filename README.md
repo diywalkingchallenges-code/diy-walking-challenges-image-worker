@@ -126,6 +126,12 @@ fresh review of its current schema, license, availability, output rights, and pr
 
 ## Development
 
+`GET /v1/quota` provides a read-only snapshot of the configured shared estimated Neuron budget,
+the requesting installation's remaining generations (when capped), and the next UTC reset.
+It requires `X-DIYWC-Installation-ID`, uses the existing D1 tables, and does not reserve attempts,
+run AI, or retain raw IDs. Status checks use a separate burst key. The Android app requests this
+snapshot only for its built-in service and hides the shared meter for every private server profile.
+
 Requirements: Node.js 22 or newer and a Cloudflare account for live development.
 
 ```console

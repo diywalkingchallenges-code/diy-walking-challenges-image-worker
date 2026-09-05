@@ -134,6 +134,66 @@ function postGenerate(body: unknown, headers: HeadersInit = {}): Request {
   });
 }
 
+describe("read-only daily allowance", () => {
+  function request(method = "GET", installation = INSTALLATION_ID): Request {
+    return new Request("https://medals.example/v1/quota", { method, headers: {
+      "X-DIYWC-Installation-ID": installation, "CF-Connecting-IP": "203.0.113.9",
+    } });
+  }
+
+  it("reports the configured shared budget and the installation's remaining attempts without reserving anything", async () => {
+    const env = mockEnv({}, { globalBudgetUsed: 2_000, installationAttemptsUsed: 4 });
+    const response = await worker.fetch(request(), env);
+    const body = await response.json() as any;
+    expect(response.status).toBe(200);
+    expect(response.headers.get("cache-control")).toBe("no-store");
+    expect(body.sharedNeurons).toEqual({ total: 8_000, used: 2_000, remaining: 6_000, estimated: true });
+    expect(body.installation).toEqual({ total: 6, remaining: 2 });
+    expect(new Date(body.resetsAtEpochMillis).toISOString()).toMatch(/T00:00:00.000Z$/u);
+    expect(body.resetsAtEpochMillis).toBeGreaterThan(Date.now());
+    expect(env.AI.run).not.toHaveBeenCalled();
+    expect(env.INSTALL_RATE_LIMITER.limit).not.toHaveBeenCalled();
+    expect(env.IP_RATE_LIMITER.limit).not.toHaveBeenCalled();
+    const sql = vi.mocked(env.QUOTA_DB.prepare).mock.calls.map(([query]) => query);
+    expect(sql.length).toBe(2);
+    expect(sql.every(query => query.trimStart().startsWith("SELECT"))).toBe(true);
+    expect(JSON.stringify(body)).not.toContain(INSTALLATION_ID);
+  });
+
+  it("reports a full new UTC day and clamps an over-budget day to zero remaining", async () => {
+    const fresh = await worker.fetch(request(), mockEnv({}, { installationAttemptsUsed: 0 }));
+    expect((await fresh.json() as any).sharedNeurons.remaining).toBe(8_000);
+    const exhausted = await worker.fetch(request(), mockEnv({}, { globalBudgetUsed: 9_000, installationAttemptsUsed: 7 }));
+    const body = await exhausted.json() as any;
+    expect(body.sharedNeurons.remaining).toBe(0);
+    expect(body.installation.remaining).toBe(0);
+  });
+
+  it("does not invent personal caps for uncapped servers", async () => {
+    const env = mockEnv({ ENFORCE_INSTALLATION_DAILY_CAPS: "false" });
+    const response = await worker.fetch(request(), env);
+    expect((await response.json() as any).installation).toBeUndefined();
+    expect(vi.mocked(env.QUOTA_DB.prepare).mock.calls).toHaveLength(1);
+  });
+
+  it("validates method and opaque installation ID before reading quota data", async () => {
+    const env = mockEnv();
+    expect((await worker.fetch(request("POST"), env)).status).toBe(405);
+    expect((await worker.fetch(request("GET", "bad"), env)).status).toBe(400);
+    expect(env.QUOTA_DB.prepare).not.toHaveBeenCalled();
+  });
+
+  it("uses its own rate limit key and does not read the database when throttled", async () => {
+    const env = mockEnv();
+    vi.mocked(env.REPORT_RATE_LIMITER.limit).mockResolvedValue({ success: false });
+    const response = await worker.fetch(request(), env);
+    expect(response.status).toBe(429);
+    expect(response.headers.get("Retry-After")).toBe("60");
+    expect(env.QUOTA_DB.prepare).not.toHaveBeenCalled();
+    expect(env.INSTALL_RATE_LIMITER.limit).not.toHaveBeenCalled();
+  });
+});
+
 describe("service landing page", () => {
   it("shows a friendly branded status page at the root URL", async () => {
     const response = await worker.fetch(new Request("https://medals.example/"), mockEnv());

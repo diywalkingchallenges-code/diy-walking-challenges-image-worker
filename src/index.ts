@@ -22,6 +22,8 @@ import {
   INSTALLATION_DAILY_ATTEMPT_LIMIT,
   parseBooleanFlag,
   parsePositiveLimit,
+  readGlobalNeuronBudget,
+  readInstallationAttemptCount,
   pruneExpiredDailyQuota,
   reserveGenerationBudget,
   secondsUntilNextUtcDay,
@@ -451,6 +453,36 @@ async function applyGenerationBurstLimits(
   return installationHash;
 }
 
+async function handleQuota(request: Request, env: Env, origin: string | undefined): Promise<Response> {
+  const pepper = requireSecret(env.RATE_LIMIT_HASH_PEPPER);
+  const installationId = requireInstallationId(request);
+  const ip = request.headers.get("CF-Connecting-IP");
+  if (!ip) throw new ApiError(400, "invalid_request", "Client network information is unavailable");
+  // Separate keys keep read-only checks from consuming generation/report burst allowances.
+  const quotaKey = await hashRateLimitKey("quota-status-ip", ip, pepper);
+  if (!(await env.REPORT_RATE_LIMITER.limit({ key: quotaKey })).success) {
+    throw new ApiError(429, "rate_limited", "Please wait a minute before checking the allowance again", true, 60);
+  }
+  const installationHash = await hashRateLimitKey("installation", installationId, pepper);
+  const instant = new Date();
+  const day = instant.toISOString().slice(0, 10);
+  const total = parsePositiveLimit(env.DAILY_GLOBAL_NEURON_BUDGET, 10_000);
+  const enforced = parseBooleanFlag(env.ENFORCE_INSTALLATION_DAILY_CAPS, true);
+  const [neurons, attempts] = await Promise.all([
+    readGlobalNeuronBudget(env.QUOTA_DB, day, total),
+    enforced ? readInstallationAttemptCount(env.QUOTA_DB, day, installationHash) : Promise.resolve(null),
+  ]);
+  return jsonResponse({
+    apiVersion: API_VERSION,
+    resetsAtEpochMillis: Date.parse(`${day}T00:00:00Z`) + 86_400_000,
+    sharedNeurons: { total, used: neurons.used, remaining: neurons.remaining, estimated: true },
+    ...(attempts !== null ? { installation: {
+      total: INSTALLATION_DAILY_ATTEMPT_LIMIT,
+      remaining: Math.max(0, INSTALLATION_DAILY_ATTEMPT_LIMIT - attempts),
+    } } : {}),
+  }, 200, origin);
+}
+
 async function handleGenerate(
   request: Request,
   env: Env,
@@ -794,6 +826,10 @@ async function dispatch(
       200,
       origin,
     );
+  }
+  if (url.pathname === "/v1/quota") {
+    if (request.method !== "GET") throw new ApiError(405, "method_not_allowed", "Method not allowed");
+    return handleQuota(request, env, origin);
   }
   if (url.pathname === "/v1/generate") {
     if (request.method !== "POST") throw new ApiError(405, "method_not_allowed", "Method not allowed");
