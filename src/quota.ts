@@ -27,7 +27,7 @@ type SlotReservation = {
   artworkSlotAttempts: CounterReservation;
 };
 
-async function readInstallationAttemptCount(
+export async function readInstallationAttemptCount(
   db: D1Database,
   day: string,
   installationHash: string,
@@ -129,7 +129,7 @@ async function reserveGlobalNeuronBudget(
     : null;
 }
 
-async function readGlobalNeuronBudget(
+export async function readGlobalNeuronBudget(
   db: D1Database,
   day: string,
   cap: number,
