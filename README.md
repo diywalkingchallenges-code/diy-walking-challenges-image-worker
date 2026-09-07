@@ -1,5 +1,11 @@
 # DIY Walking Challenges Image Worker
 
+Racer icons (Android 2.17.59): the Klein model advertises `racer_icon` with a square 512 × 512
+output and an icon-specific prompt. The app crops and compresses the selection for map/race use.
+The normal installation and per-artwork quotas, canceled/failed-image accounting, and report flow
+apply. Run all migrations before deploying: migration 0005 preserves existing reservations and
+diagnostics while adding the new artwork kind. `npm run check` and `npm test` cover the catalog,
+full generation endpoint, output cost, and migration preservation.
 This is the optional, self-hostable image-generation service for **DIY Walking Challenges**. It can
 create original completion medals, milestone banners, and decorative route-map backgrounds using
 [Cloudflare Workers AI](https://developers.cloudflare.com/workers-ai/).
