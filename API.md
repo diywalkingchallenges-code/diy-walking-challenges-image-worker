@@ -31,6 +31,9 @@ and the artwork types each model can create.
     "installationDailyCapsEnforced": false,
     "artworkSlotDailyAttemptLimit": 1,
     "artworkSlotIdSupported": true,
+    "generationCancellationSupported": true,
+    "outcomeAccountingSupported": true,
+    "freeFailureNeuronLimit": 500,
     "legacyMissingArtworkSlotScope": "installation_asset_kind",
     "resets": "utc_day"
   },
@@ -259,8 +262,8 @@ independent slots. An older client that omits `artworkSlotId` is conservatively 
 legacy slot per installation and `assetKind`; omission never bypasses the cap. The backend also makes
 an exact D1 reservation against a separate global conservative estimated-Neuron budget. The estimate
 includes variable Llama Guard headroom and the selected image output/reference tiles; it is not
-Cloudflare's authoritative bill. Reservations made before classification/inference are not refunded
-after rejection, cancellation, timeout, or upstream failure.
+Cloudflare's authoritative bill. Settlement retains the estimate for AI stages that started and
+returns only the reservation for work that never started, including on rejection or cancellation.
 
 This self-host template sets `ENFORCE_INSTALLATION_DAILY_CAPS=false`. That removes the six-per-day
 and per-artwork-slot app limits, while burst controls, safety checks, and the configured global Neuron
@@ -268,10 +271,38 @@ guard remain. In uncapped mode the new installation/slot headers are omitted. Th
 `X-DIYWC-Model-Attempts-*` headers remain as a non-authoritative compatibility sentinel for old app
 versions; clients must use `installationDailyCapsEnforced` as the source of truth.
 
-The service does not save generated images. Generation is intentionally non-idempotent: the Android
-client should generate only after an explicit tap and must not automatically retry an ambiguous
-timeout. Canceling the download does not guarantee that already-started classification or inference
-is canceled, and the reserved quota remains consumed.
+The service does not save generated images. Supply an optional lowercase UUID `generationId` in
+POST /v1/generate when `generationCancellationSupported` is advertised. Reusing the same UUID for
+the same installation never runs AI twice; it returns `generation_already_submitted` or
+`generation_canceled` (409). Generate only after an explicit user action. Do not automatically
+retry an ambiguous timeout with a fresh ID.
+
+Failed/canceled requests return their personal use while the individual artwork's cumulative
+started-work estimate is at most 500 Neurons for that UTC day, across models. The request crossing
+500 keeps its use. Success counts normally. The shared budget retains the estimate for each
+started AI stage; only unstarted work is returned. Safety rules that reject without invoking AI
+spend zero. These are conservative model/token estimates, not the provider's billing meter.
+
+## `POST /v1/cancel`
+
+Send `{"generationId":"<same UUID as generate>"}` with the same X-DIYWC-Installation-ID header.
+Cancellation is idempotent and scoped to that installation. An early request creates a tombstone
+so a delayed generate POST cannot start; a stage already claimed may finish but later stages
+cannot start. A five-minute delivery window handles cancellation racing a successful download.
+Outside that window completed images remain counted. Responses include status and, on capped
+servers, `artworkAllowance` when the artwork is known. Preparing work may still be pending.
+
+Generation errors also include `error.artworkAllowance` after settlement. GET /v1/quota accepts
+optional `artworkSlotId` and `assetKind` query parameters to return the same structure on reopening:
+
+```json
+{"installationRemaining":6,"artworkSlotRemaining":1,"estimatedNeuronsUsed":200,
+ "freeFailureNeuronLimit":500,"resetsAtEpochMillis":1799452800000,"pending":false}
+```
+
+A pending reservation is not a permanent daily rejection. Read status again after it settles;
+never grant a local refund without a server response. Artwork allowances are omitted for uncapped
+private servers. The Android app hides the shared meter for all private profiles.
 
 If an image does not fit in the remaining shared daily budget, `daily_quota_exhausted` reports the
 estimated request cost and the current estimated usage and remainder in both JSON and the
@@ -365,7 +396,7 @@ useful wait is known. Short burst, per-slot, and six-attempt installation limits
 daily shutdowns return `503` so the app can prominently offer its own artwork upload fallback.
 
 The app should permit only one generation request at a time. It must not automatically retry an
-ambiguous timeout: inference may have started and its reserved attempt remains consumed.
+ambiguous timeout: inference may have started. Cancel/check the existing generation ID instead of automatically starting fresh work.
 
 ## Browser access
 
