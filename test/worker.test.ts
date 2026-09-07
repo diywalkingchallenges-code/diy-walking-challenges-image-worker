@@ -219,7 +219,7 @@ describe("service landing page", () => {
     expect(html).not.toContain("<script");
     expect(html).not.toContain("<form");
     expect(html).not.toContain("RATE_LIMIT_HASH_PEPPER");
-    expect(html).not.toContain("example-sensitive-account-id");
+    expect(html).not.toContain("555660e547341e8a1afe9934bedc2f7f");
     expect(html).not.toContain("flux-schnell");
     expect(html).not.toContain("not_found");
   });
@@ -376,6 +376,8 @@ describe("model catalog", () => {
       },
     ]);
     expect(body.models[1].assetKinds).toEqual([
+      expect.objectContaining({ id: "racer_icon", baseEstimatedImageNeurons: 27,
+        output: { width: 512, height: 512, providerControlled: false }, supportsReference: true }),
       expect.objectContaining({
         id: "medal",
         baseEstimatedImageNeurons: 27,
@@ -403,6 +405,13 @@ describe("model catalog", () => {
         },
       }),
     ]);
+  });
+
+  it("frames racer icons for small circular markers", () => {
+    const prompt = buildAssetPrompt("racer_icon", "a cheerful fox");
+    expect(prompt).toContain("a cheerful fox");
+    expect(prompt).toContain("circular safe area");
+    expect(prompt).toContain("No text");
   });
 
   it("cannot enable the five non-production adapters through configuration alone", async () => {
@@ -436,6 +445,7 @@ describe("model catalog", () => {
     };
     const cases = [
       ["medal", 512, 512, 27, 32],
+      ["racer_icon", 512, 512, 27, 32],
       ["milestone_banner", MILESTONE_BANNER_WIDTH, MILESTONE_BANNER_HEIGHT, 53, 58],
       ["route_map", ROUTE_MAP_WIDTH, ROUTE_MAP_HEIGHT, 105, 110],
     ] as const;
@@ -778,6 +788,7 @@ describe("POST /v1/generate", () => {
   });
 
   it.each([
+    ["racer_icon", 512, 512, 27, "Create an original square personal racer avatar showing:", "racer-icon"],
     [
       "milestone_banner",
       MILESTONE_BANNER_WIDTH,
