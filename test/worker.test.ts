@@ -219,7 +219,7 @@ describe("service landing page", () => {
     expect(html).not.toContain("<script");
     expect(html).not.toContain("<form");
     expect(html).not.toContain("RATE_LIMIT_HASH_PEPPER");
-    expect(html).not.toContain("555660e547341e8a1afe9934bedc2f7f");
+    expect(html).not.toContain("example-sensitive-account-id");
     expect(html).not.toContain("flux-schnell");
     expect(html).not.toContain("not_found");
   });

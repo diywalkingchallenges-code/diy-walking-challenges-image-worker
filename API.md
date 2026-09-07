@@ -28,7 +28,7 @@ and the artwork types each model can create.
   "quota": {
     "dailyAttemptLimit": 6,
     "dailyAttemptScope": "installation",
-    "installationDailyCapsEnforced": true,
+    "installationDailyCapsEnforced": false,
     "artworkSlotDailyAttemptLimit": 1,
     "artworkSlotIdSupported": true,
     "generationCancellationSupported": true,
@@ -262,10 +262,10 @@ independent slots. An older client that omits `artworkSlotId` is conservatively 
 legacy slot per installation and `assetKind`; omission never bypasses the cap. The backend also makes
 an exact D1 reservation against a separate global conservative estimated-Neuron budget. The estimate
 includes variable Llama Guard headroom and the selected image output/reference tiles; it is not
-Cloudflare's authoritative bill. Reservations made before classification/inference are not refunded
-after rejection, cancellation, timeout, or upstream failure.
+Cloudflare's authoritative bill. Settlement retains the estimate for AI stages that started and
+returns only the reservation for work that never started, including on rejection or cancellation.
 
-Self-hosters may explicitly set `ENFORCE_INSTALLATION_DAILY_CAPS=false`. That removes the six-per-day
+This self-host template sets `ENFORCE_INSTALLATION_DAILY_CAPS=false`. That removes the six-per-day
 and per-artwork-slot app limits, while burst controls, safety checks, and the configured global Neuron
 guard remain. In uncapped mode the new installation/slot headers are omitted. The legacy
 `X-DIYWC-Model-Attempts-*` headers remain as a non-authoritative compatibility sentinel for old app
