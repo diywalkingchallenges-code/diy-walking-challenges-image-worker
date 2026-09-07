@@ -34,6 +34,16 @@ before deploying or changing the budget.
 For a screen-by-screen explanation, including what to enter for each private code, see
 **[DEPLOY.md](DEPLOY.md)**.
 
+## Failed and canceled generations
+
+When daily caps are enabled, failures and cancellations return the use through 500 estimated
+Neurons for each individual map, medal, or milestone per UTC day. The request crossing 500 counts;
+successful images count normally. Switching models shares the same artwork counter. The global
+budget retains started AI work, including canceled work. Migration 0004 adds atomic outcome and
+per-artwork accounting. POST /v1/cancel uses the generation UUID and installation header; updated
+clients reconcile allowances after cancellation and when reopening the editor. Uncapped private
+servers stay uncapped. No prompt or image is stored in these accounting records.
+
 ## Connect the Android app
 
 After Cloudflare says the deployment succeeded:
@@ -130,7 +140,7 @@ fresh review of its current schema, license, availability, output rights, and pr
 the requesting installation's remaining generations (when capped), and the next UTC reset.
 It requires `X-DIYWC-Installation-ID`, uses the existing D1 tables, and does not reserve attempts,
 run AI, or retain raw IDs. Status checks use a separate burst key. The Android app requests this
-snapshot only for its built-in service and hides the shared meter for every private server profile.
+snapshot to reconcile supported per-artwork allowances and hides the shared meter for every private server profile.
 
 Requirements: Node.js 22 or newer and a Cloudflare account for live development.
 

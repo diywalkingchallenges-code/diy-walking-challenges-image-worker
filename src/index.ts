@@ -1,3 +1,5 @@
+import { beginGeneration, cancelGeneration, finishGeneration, readArtworkAllowance, readGeneration,
+  setGenerationReservation, startGenerationStage, FREE_FAILED_GENERATION_NEURONS, type ArtworkAllowance } from "./generation-accounting";
 import { ImageValidationError, sha256Hex, validateGeneratedImage, validateReferenceImage } from "./images";
 import { recordProviderFailureDiagnostic } from "./failure-diagnostics";
 import {
@@ -39,6 +41,7 @@ import {
 import type { Env, ParsedGenerationRequest, ReferenceImage } from "./types";
 
 const API_VERSION = 1;
+const GENERATION_ID_PATTERN = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/u;
 const MAX_GENERATE_BODY_BYTES = 3 * 1024 * 1024;
 const MAX_REPORT_BODY_BYTES = 8 * 1024;
 const MAX_REFERENCE_BYTES = 2 * 1024 * 1024;
@@ -47,6 +50,8 @@ const INSTALLATION_ID_PATTERN = /^[A-Za-z0-9._-]{20,80}$/u;
 const ARTWORK_SLOT_ID_PATTERN = /^[A-Za-z0-9][A-Za-z0-9._:-]{7,159}$/u;
 
 type ErrorCode =
+  | "generation_canceled"
+  | "generation_already_submitted"
   | "content_rejected"
   | "daily_quota_exhausted"
   | "invalid_prompt"
@@ -73,6 +78,7 @@ type NeuronQuotaDetails = {
 };
 
 class ApiError extends Error {
+  artworkAllowance?: ArtworkAllowance;
   constructor(
     readonly status: number,
     readonly code: ErrorCode,
@@ -231,6 +237,7 @@ function errorResponse(error: ApiError, requestId: string, origin: string | unde
         message: error.message,
         retryable: error.retryable,
         requestId,
+        ...(error.artworkAllowance ? { artworkAllowance: error.artworkAllowance } : {}),
         ...(error.retryAfterSeconds === undefined
           ? {}
           : { retryAfterSeconds: error.retryAfterSeconds }),
@@ -349,6 +356,9 @@ function parseGenerationRequest(body: unknown, enabledConfig: string | undefined
     throw new ApiError(400, "invalid_request", "Request body must be an object");
   }
   const value = body as Record<string, unknown>;
+  if (value.generationId !== undefined && (typeof value.generationId !== "string" || !GENERATION_ID_PATTERN.test(value.generationId))) {
+    throw new ApiError(400, "invalid_request", "A valid generation ID is required");
+  }
   const assetKindValue = value.assetKind ?? DEFAULT_ASSET_KIND;
   if (!isAssetKind(assetKindValue)) {
     throw new ApiError(400, "invalid_request", "That artwork type is not available");
@@ -412,6 +422,7 @@ function parseGenerationRequest(body: unknown, enabledConfig: string | undefined
   }
   return {
     assetKind: assetKindValue,
+    generationId: value.generationId as string | undefined,
     ...(artworkSlotId ? { artworkSlotId } : {}),
     model: value.model as string,
     userPrompt,
@@ -472,10 +483,22 @@ async function handleQuota(request: Request, env: Env, origin: string | undefine
     readGlobalNeuronBudget(env.QUOTA_DB, day, total),
     enforced ? readInstallationAttemptCount(env.QUOTA_DB, day, installationHash) : Promise.resolve(null),
   ]);
+  const query = new URL(request.url).searchParams;
+  let artworkAllowance: ArtworkAllowance | undefined;
+  if (enforced && query.has("artworkSlotId")) {
+    const slotId = query.get("artworkSlotId") ?? "";
+    const kind = query.get("assetKind");
+    if (!ARTWORK_SLOT_ID_PATTERN.test(slotId) || !isAssetKind(kind)) {
+      throw new ApiError(400, "invalid_request", "A valid artwork destination is required");
+    }
+    const slotHash = await hashRateLimitKey("artwork-slot", `${installationHash}\n${kind}\n${slotId}`, pepper);
+    artworkAllowance = await readArtworkAllowance(env.QUOTA_DB, day, installationHash, slotHash);
+  }
   return jsonResponse({
     apiVersion: API_VERSION,
     resetsAtEpochMillis: Date.parse(`${day}T00:00:00Z`) + 86_400_000,
     sharedNeurons: { total, used: neurons.used, remaining: neurons.remaining, estimated: true },
+    ...(artworkAllowance ? { artworkAllowance } : {}),
     ...(attempts !== null ? { installation: {
       total: INSTALLATION_DAILY_ATTEMPT_LIMIT,
       remaining: Math.max(0, INSTALLATION_DAILY_ATTEMPT_LIMIT - attempts),
@@ -520,179 +543,239 @@ async function handleGenerate(
     `${installationHash}\n${parsed.assetKind}\n${parsed.artworkSlotId ?? `legacy:${parsed.assetKind}`}`,
     pepper,
   );
-  const retryAfter = secondsUntilNextUtcDay();
-  let reservation: Awaited<ReturnType<typeof reserveGenerationBudget>>;
+  const instant = new Date();
+  const key = { installationHash, generationId: parsed.generationId ?? requestId };
+  if (!(await beginGeneration(env.QUOTA_DB, key, requestId, artworkSlotHash, instant))) {
+    const old = await readGeneration(env.QUOTA_DB, key);
+    throw new ApiError(409, old?.cancel_requested ? "generation_canceled" : "generation_already_submitted",
+      old?.cancel_requested ? "Generation canceled." : "This generation request has already been submitted.");
+  }
+  let reservedNeurons = 0;
+  const retryAfter = secondsUntilNextUtcDay(instant);
   try {
-    reservation = await reserveGenerationBudget(
-      env.QUOTA_DB,
-      {
-        installationHash,
-        artworkSlotHash,
-        reservationId: requestId,
-        assetKind: parsed.assetKind,
-        estimatedNeurons,
-        globalNeuronBudget,
-        enforceInstallationDailyCaps,
-      },
-    );
-  } catch {
-    throw new ApiError(
-      503,
-      "service_unavailable",
-      "Image generation is temporarily unavailable. You can still upload your own artwork.",
-      true,
-      60,
-    );
-  }
-  if (reservation.result === "installation_exhausted") {
-    throw new ApiError(
-      429,
-      "installation_daily_limit_reached",
-      `This app installation has used today's ${INSTALLATION_DAILY_ATTEMPT_LIMIT} shared-server image attempts. Try again after the 00:00 UTC daily reset, use a private image server, or upload your own artwork.`,
-      true,
-      retryAfter,
-    );
-  }
-  if (reservation.result === "artwork_slot_exhausted") {
-    throw new ApiError(
-      429,
-      "artwork_slot_daily_limit_reached",
-      "This artwork already used its shared-server generation attempt today. Try again after the 00:00 UTC daily reset, use a private image server, or upload your own artwork.",
-      true,
-      retryAfter,
-    );
-  }
-  if (reservation.result === "global_exhausted") {
-    const quota = {
-      requested: reservation.estimatedNeurons,
-      used: reservation.globalNeurons.used,
-      remaining: reservation.globalNeurons.remaining,
-    };
-    throw new ApiError(
-      503,
-      "daily_quota_exhausted",
-      `Today's shared server allowance has ${quota.remaining} estimated Neurons left, but this image needs ${quota.requested}. Try again after the 00:00 UTC daily reset or upload your own artwork.`,
-      true,
-      retryAfter,
-      quota,
-    );
-  }
-
-  try {
-    await assertPromptSafe(env.AI, parsed.userPrompt, env.SAFETY_MODEL);
-  } catch (error) {
-    if (error instanceof UnsafePromptError) {
-      throw new ApiError(
-        422,
-        "content_rejected",
-        "That description cannot be used for image generation. Try a different, family-friendly idea.",
+    let reservation: Awaited<ReturnType<typeof reserveGenerationBudget>>;
+    try {
+      reservation = await reserveGenerationBudget(
+        env.QUOTA_DB,
+        {
+          installationHash,
+          artworkSlotHash,
+          reservationId: requestId,
+          assetKind: parsed.assetKind,
+          estimatedNeurons,
+          globalNeuronBudget,
+          enforceInstallationDailyCaps,
+          instant,
+        },
       );
-    }
-    if (error instanceof SafetyServiceError) {
+    } catch {
       throw new ApiError(
         503,
         "service_unavailable",
-        "Safety screening is temporarily unavailable. You can still upload your own artwork.",
+        "Image generation is temporarily unavailable. You can still upload your own artwork.",
+        true,
+        60,
+      );
+    }
+    if (reservation.result === "installation_exhausted") {
+      throw new ApiError(
+        429,
+        "installation_daily_limit_reached",
+        `This app installation has used today's ${INSTALLATION_DAILY_ATTEMPT_LIMIT} shared-server image attempts. Try again after the 00:00 UTC daily reset, use a private image server, or upload your own artwork.`,
+        true,
+        retryAfter,
+      );
+    }
+    if (reservation.result === "artwork_slot_exhausted") {
+      throw new ApiError(
+        429,
+        "artwork_slot_daily_limit_reached",
+        "This artwork already used its shared-server generation attempt today. Try again after the 00:00 UTC daily reset, use a private image server, or upload your own artwork.",
+        true,
+        retryAfter,
+      );
+    }
+    if (reservation.result === "global_exhausted") {
+      const quota = {
+        requested: reservation.estimatedNeurons,
+        used: reservation.globalNeurons.used,
+        remaining: reservation.globalNeurons.remaining,
+      };
+      throw new ApiError(
+        503,
+        "daily_quota_exhausted",
+        `Today's shared server allowance has ${quota.remaining} estimated Neurons left, but this image needs ${quota.requested}. Try again after the 00:00 UTC daily reset or upload your own artwork.`,
+        true,
+        retryAfter,
+        quota,
+      );
+    }
+
+    reservedNeurons = reservation.estimatedNeurons;
+    await setGenerationReservation(env.QUOTA_DB, key, reservedNeurons);
+    const trackedAi = {
+      async run(modelId: string, inputs: unknown): Promise<unknown> {
+        const neurons = modelId === model.cloudflareId ? model.estimateImageNeurons(asset, parsed.reference) : safetyNeurons;
+        if (!(await startGenerationStage(env.QUOTA_DB, key, neurons))) {
+          throw new ApiError(409, "generation_canceled", "Generation canceled.");
+        }
+        return env.AI.run(modelId, inputs);
+      },
+    };
+    try {
+      if (!(await startGenerationStage(env.QUOTA_DB, key, 0))) throw new ApiError(409, "generation_canceled", "Generation canceled.");
+      await assertPromptSafe(trackedAi, parsed.userPrompt, env.SAFETY_MODEL);
+    } catch (error) {
+      if (error instanceof UnsafePromptError) {
+        throw new ApiError(
+          422,
+          "content_rejected",
+          "That description cannot be used for image generation. Try a different, family-friendly idea.",
+        );
+      }
+      if (error instanceof SafetyServiceError) {
+        throw new ApiError(
+          503,
+          "service_unavailable",
+          "Safety screening is temporarily unavailable. You can still upload your own artwork.",
+          true,
+          120,
+        );
+      }
+      throw error;
+    }
+
+    let bytes: Uint8Array;
+    try {
+      bytes = await runImageModel(
+        trackedAi,
+        model,
+        asset,
+        buildAssetPrompt(parsed.assetKind, parsed.userPrompt),
+        parsed.seed,
+        parsed.reference,
+      );
+    } catch (error) {
+      if (error instanceof ApiError && error.code === "generation_canceled") throw error;
+      const failure = classifyCloudflareAiError(error, retryAfter);
+      await recordProviderFailureDiagnostic(env.QUOTA_DB, {
+        requestId,
+        modelAlias: model.alias,
+        assetKind: parsed.assetKind,
+        providerCode: failure.providerCode,
+        category: failure.category,
+      });
+      throw new ApiError(
+        failure.api.status,
+        failure.api.code,
+        failure.api.message,
+        failure.api.retryable,
+        failure.api.retryAfterSeconds,
+      );
+    }
+    let image;
+    try {
+      image = validateGeneratedImage(
+        bytes,
+        asset.output.providerControlled ? undefined : asset.output,
+      );
+    } catch {
+      await recordProviderFailureDiagnostic(env.QUOTA_DB, {
+        requestId,
+        modelAlias: model.alias,
+        assetKind: parsed.assetKind,
+        providerCode: "unknown",
+        category: "invalid_output",
+      });
+      throw new ApiError(
+        503,
+        "model_invalid_output",
+        "The image model returned an unusable image. Try again or upload your own artwork.",
         true,
         120,
       );
     }
-    throw error;
-  }
-
-  let bytes: Uint8Array;
-  try {
-    bytes = await runImageModel(
-      env.AI,
-      model,
-      asset,
-      buildAssetPrompt(parsed.assetKind, parsed.userPrompt),
-      parsed.seed,
-      parsed.reference,
+    const [sha, reportToken] = await Promise.all([
+      sha256Hex(bytes),
+      createReportToken(requestId, installationHash, reportSecret),
+    ]);
+    const settled = await finishGeneration(env.QUOTA_DB, key, "succeeded");
+    if (settled?.status !== "succeeded") throw new ApiError(409, "generation_canceled", "Generation canceled.");
+    const headers = securityHeaders();
+    headers.set("Content-Type", image.mimeType);
+    headers.set("Content-Length", String(bytes.byteLength));
+    const extension = image.mimeType === "image/jpeg" ? "jpg" : image.mimeType.split("/")[1];
+    const filenameKind = parsed.assetKind.replaceAll("_", "-");
+    headers.set("Content-Disposition", `inline; filename="diywc-${filenameKind}-${requestId}.${extension}"`);
+    headers.set("X-DIYWC-Request-ID", requestId);
+    headers.set("X-DIYWC-Asset-Kind", parsed.assetKind);
+    headers.set("X-DIYWC-Report-Token", reportToken);
+    headers.set("X-DIYWC-Model", model.alias);
+    headers.set("X-DIYWC-SHA256", sha);
+    headers.set("X-DIYWC-Width", String(image.width));
+    headers.set("X-DIYWC-Height", String(image.height));
+    if (reservation.installationAttempts && reservation.artworkSlotAttempts) {
+      // The legacy names retain parser compatibility but now report the
+      // across-model installation cap; the additive names are unambiguous.
+      headers.set("X-DIYWC-Model-Attempts-Used", String(reservation.installationAttempts.used));
+      headers.set("X-DIYWC-Model-Attempts-Remaining", String(reservation.installationAttempts.remaining));
+      headers.set("X-DIYWC-Installation-Attempts-Used", String(reservation.installationAttempts.used));
+      headers.set("X-DIYWC-Installation-Attempts-Remaining", String(reservation.installationAttempts.remaining));
+      headers.set("X-DIYWC-Artwork-Slot-Attempts-Used", String(reservation.artworkSlotAttempts.used));
+      headers.set("X-DIYWC-Artwork-Slot-Attempts-Remaining", String(reservation.artworkSlotAttempts.remaining));
+    } else {
+      // Old clients require these integer headers. In uncapped mode they are a
+      // compatibility sentinel only; the catalog's enforcement flag is authoritative.
+      headers.set("X-DIYWC-Model-Attempts-Used", "0");
+      headers.set("X-DIYWC-Model-Attempts-Remaining", String(INSTALLATION_DAILY_ATTEMPT_LIMIT));
+    }
+    headers.set("X-DIYWC-Estimated-Neurons", String(reservation.estimatedNeurons));
+    headers.set(
+      "X-DIYWC-Global-Estimated-Neurons-Used",
+      String(reservation.globalNeurons.used),
     );
+    headers.set(
+      "X-DIYWC-Global-Estimated-Neurons-Remaining",
+      String(reservation.globalNeurons.remaining),
+    );
+    addCorsHeaders(headers, origin);
+    const responseBody = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
+    return new Response(responseBody, { status: 200, headers });
   } catch (error) {
-    const failure = classifyCloudflareAiError(error, retryAfter);
-    await recordProviderFailureDiagnostic(env.QUOTA_DB, {
-      requestId,
-      modelAlias: model.alias,
-      assetKind: parsed.assetKind,
-      providerCode: failure.providerCode,
-      category: failure.category,
-    });
-    throw new ApiError(
-      failure.api.status,
-      failure.api.code,
-      failure.api.message,
-      failure.api.retryable,
-      failure.api.retryAfterSeconds,
-    );
+    // A cancellation during reservation waits for its owner to publish the reservation before settling.
+    await setGenerationReservation(env.QUOTA_DB, key, reservedNeurons);
+    const finalAttempt = await finishGeneration(env.QUOTA_DB, key, "failed");
+    const failure = finalAttempt?.status === "canceled" ? new ApiError(409, "generation_canceled", "Generation canceled.")
+      : error instanceof ApiError ? error : new ApiError(503, "service_unavailable",
+      "Image generation is temporarily unavailable. Try again shortly.", true, 60);
+    if (enforceInstallationDailyCaps) {
+      failure.artworkAllowance = await readArtworkAllowance(env.QUOTA_DB, instant.toISOString().slice(0, 10), installationHash, artworkSlotHash);
+    }
+    throw failure;
   }
-  let image;
-  try {
-    image = validateGeneratedImage(
-      bytes,
-      asset.output.providerControlled ? undefined : asset.output,
-    );
-  } catch {
-    await recordProviderFailureDiagnostic(env.QUOTA_DB, {
-      requestId,
-      modelAlias: model.alias,
-      assetKind: parsed.assetKind,
-      providerCode: "unknown",
-      category: "invalid_output",
-    });
-    throw new ApiError(
-      503,
-      "model_invalid_output",
-      "The image model returned an unusable image. Try again or upload your own artwork.",
-      true,
-      120,
-    );
-  }
-  const [sha, reportToken] = await Promise.all([
-    sha256Hex(bytes),
-    createReportToken(requestId, installationHash, reportSecret),
+}
+
+async function handleCancel(request: Request, env: Env, origin: string | undefined): Promise<Response> {
+  const pepper = requireSecret(env.RATE_LIMIT_HASH_PEPPER);
+  const installationId = requireInstallationId(request);
+  const installationHash = await hashRateLimitKey("installation", installationId, pepper);
+  const ip = request.headers.get("CF-Connecting-IP");
+  if (!ip) throw new ApiError(400, "invalid_request", "Client network information is unavailable");
+  const [cancelKey, cancelIpKey] = await Promise.all([
+    hashRateLimitKey("cancel", installationId, pepper), hashRateLimitKey("cancel-ip", ip, pepper),
   ]);
-  const headers = securityHeaders();
-  headers.set("Content-Type", image.mimeType);
-  headers.set("Content-Length", String(bytes.byteLength));
-  const extension = image.mimeType === "image/jpeg" ? "jpg" : image.mimeType.split("/")[1];
-  const filenameKind = parsed.assetKind.replaceAll("_", "-");
-  headers.set("Content-Disposition", `inline; filename="diywc-${filenameKind}-${requestId}.${extension}"`);
-  headers.set("X-DIYWC-Request-ID", requestId);
-  headers.set("X-DIYWC-Asset-Kind", parsed.assetKind);
-  headers.set("X-DIYWC-Report-Token", reportToken);
-  headers.set("X-DIYWC-Model", model.alias);
-  headers.set("X-DIYWC-SHA256", sha);
-  headers.set("X-DIYWC-Width", String(image.width));
-  headers.set("X-DIYWC-Height", String(image.height));
-  if (reservation.installationAttempts && reservation.artworkSlotAttempts) {
-    // The legacy names retain parser compatibility but now report the
-    // across-model installation cap; the additive names are unambiguous.
-    headers.set("X-DIYWC-Model-Attempts-Used", String(reservation.installationAttempts.used));
-    headers.set("X-DIYWC-Model-Attempts-Remaining", String(reservation.installationAttempts.remaining));
-    headers.set("X-DIYWC-Installation-Attempts-Used", String(reservation.installationAttempts.used));
-    headers.set("X-DIYWC-Installation-Attempts-Remaining", String(reservation.installationAttempts.remaining));
-    headers.set("X-DIYWC-Artwork-Slot-Attempts-Used", String(reservation.artworkSlotAttempts.used));
-    headers.set("X-DIYWC-Artwork-Slot-Attempts-Remaining", String(reservation.artworkSlotAttempts.remaining));
-  } else {
-    // Old clients require these integer headers. In uncapped mode they are a
-    // compatibility sentinel only; the catalog's enforcement flag is authoritative.
-    headers.set("X-DIYWC-Model-Attempts-Used", "0");
-    headers.set("X-DIYWC-Model-Attempts-Remaining", String(INSTALLATION_DAILY_ATTEMPT_LIMIT));
+  const allowed = await Promise.all([env.REPORT_RATE_LIMITER.limit({ key: cancelKey }), env.REPORT_RATE_LIMITER.limit({ key: cancelIpKey })]);
+  if (allowed.some(result => !result.success)) {
+    throw new ApiError(429, "rate_limited", "Please wait before checking cancellation again.", true, 60);
   }
-  headers.set("X-DIYWC-Estimated-Neurons", String(reservation.estimatedNeurons));
-  headers.set(
-    "X-DIYWC-Global-Estimated-Neurons-Used",
-    String(reservation.globalNeurons.used),
-  );
-  headers.set(
-    "X-DIYWC-Global-Estimated-Neurons-Remaining",
-    String(reservation.globalNeurons.remaining),
-  );
-  addCorsHeaders(headers, origin);
-  const responseBody = bytes.buffer.slice(bytes.byteOffset, bytes.byteOffset + bytes.byteLength) as ArrayBuffer;
-  return new Response(responseBody, { status: 200, headers });
+  const body = await readJsonBody(request, MAX_REPORT_BODY_BYTES) as Record<string, unknown> | null;
+  if (!body || typeof body.generationId !== "string" || !GENERATION_ID_PATTERN.test(body.generationId)) {
+    throw new ApiError(400, "invalid_request", "A valid generation ID is required");
+  }
+  const attempt = await cancelGeneration(env.QUOTA_DB, { installationHash, generationId: body.generationId });
+  const artworkAllowance = attempt?.artwork_slot_hash && parseBooleanFlag(env.ENFORCE_INSTALLATION_DAILY_CAPS, true)
+    ? await readArtworkAllowance(env.QUOTA_DB, attempt.day_utc, installationHash, attempt.artwork_slot_hash) : undefined;
+  return jsonResponse({ status: attempt?.status, ...(artworkAllowance ? { artworkAllowance } : {}) }, 200, origin);
 }
 
 async function handleReport(
@@ -782,6 +865,9 @@ async function dispatch(
           installationDailyCapsEnforced,
           artworkSlotDailyAttemptLimit: ARTWORK_SLOT_DAILY_ATTEMPT_LIMIT,
           artworkSlotIdSupported: true,
+          generationCancellationSupported: true,
+          outcomeAccountingSupported: true,
+          freeFailureNeuronLimit: FREE_FAILED_GENERATION_NEURONS,
           legacyMissingArtworkSlotScope: "installation_asset_kind",
           resets: "utc_day",
         },
@@ -835,6 +921,10 @@ async function dispatch(
     if (request.method !== "POST") throw new ApiError(405, "method_not_allowed", "Method not allowed");
     return handleGenerate(request, env, requestId, origin);
   }
+  if (url.pathname === "/v1/cancel") {
+    if (request.method !== "POST") throw new ApiError(405, "method_not_allowed", "Method not allowed");
+    return handleCancel(request, env, origin);
+  }
   if (url.pathname === "/v1/report") {
     if (request.method !== "POST") throw new ApiError(405, "method_not_allowed", "Method not allowed");
     return handleReport(request, env, origin);
@@ -843,12 +933,14 @@ async function dispatch(
 }
 
 export default {
-  async fetch(request: Request, env: Env): Promise<Response> {
+  async fetch(request: Request, env: Env, context?: ExecutionContext): Promise<Response> {
     const requestId = crypto.randomUUID();
     let origin: string | undefined;
     try {
       origin = acceptedCorsOrigin(request, env);
-      return await dispatch(request, env, requestId, origin);
+      const response = dispatch(request, env, requestId, origin);
+      context?.waitUntil(response.then(() => undefined, () => undefined));
+      return await response;
     } catch (error) {
       const apiError =
         error instanceof ApiError

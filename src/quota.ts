@@ -240,4 +240,6 @@ export async function pruneExpiredDailyQuota(
   await db.prepare(
     `DELETE FROM daily_installation_artwork_slots WHERE day_utc < ?1`,
   ).bind(cutoffDay).run();
+  await db.prepare(`DELETE FROM generation_attempts WHERE day_utc < ?1`).bind(cutoffDay).run();
+  await db.prepare(`DELETE FROM daily_artwork_neuron_usage WHERE day_utc < ?1`).bind(cutoffDay).run();
 }

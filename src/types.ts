@@ -31,6 +31,7 @@ export type ReferenceImage = {
 };
 
 export type ParsedGenerationRequest = {
+  generationId?: string;
   assetKind: AssetKind;
   artworkSlotId?: string;
   model: string;

@@ -1,4 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
+import { sqliteDatabase } from "./d1";
 import { webcrypto } from "node:crypto";
 
 import worker from "../src/index";
@@ -56,40 +57,37 @@ type MockDatabaseOptions = {
 };
 
 function mockDatabase(options: MockDatabaseOptions = {}): D1Database {
+  const real = sqliteDatabase();
+  function prepare(sql: string, values: unknown[] = []): D1PreparedStatement {
+    const statement = real.prepare(sql).bind(...values);
+    return {
+      sql,
+      executeSync: (statement as unknown as { executeSync: () => unknown }).executeSync,
+      bind: vi.fn((...bound: unknown[]) => prepare(sql, bound)),
+      first: vi.fn(async () => {
+        if (sql.includes("INSERT INTO daily_installation_artwork_slots") &&
+          (options.installationAttemptsExhausted || options.artworkSlotExhausted)) return null;
+        if (sql.includes("COUNT(*) AS attempts") && options.installationAttemptsUsed !== undefined)
+          return { attempts: options.installationAttemptsUsed };
+        if (sql.includes("SELECT 1 AS reserved") && options.artworkSlotExhausted) return { reserved: 1 };
+        if (sql.includes("daily_global_neuron_budget")) {
+          if (sql.trimStart().startsWith("SELECT") && options.globalBudgetUsed !== undefined)
+            return { estimated_neurons_used: options.globalBudgetUsed };
+          if (sql.trimStart().startsWith("INSERT") && options.globalBudgetExhausted) return null;
+        }
+        return statement.first();
+      }),
+      run: vi.fn(() => statement.run()),
+    } as unknown as D1PreparedStatement;
+  }
   return {
-    prepare: vi.fn((sql: string) => ({
-      bind: vi.fn((...values: unknown[]) => ({
-        first: vi.fn(async () => {
-          if (sql.includes("INSERT INTO daily_installation_artwork_slots")) {
-            return options.installationAttemptsExhausted || options.artworkSlotExhausted
-              ? null
-              : { reserved: 1 };
-          }
-          if (sql.includes("COUNT(*) AS attempts")) {
-            return { attempts: options.installationAttemptsUsed ?? 1 };
-          }
-          if (sql.includes("SELECT 1 AS reserved")) {
-            return options.artworkSlotExhausted ? { reserved: 1 } : null;
-          }
-          if (sql.includes("daily_global_neuron_budget")) {
-            if (sql.trimStart().startsWith("SELECT")) {
-              return options.globalBudgetUsed === undefined
-                ? null
-                : { estimated_neurons_used: options.globalBudgetUsed };
-            }
-            return options.globalBudgetExhausted
-              ? null
-              : { estimated_neurons_used: Number(values[1]) };
-          }
-          if (sql.includes("generation_reports")) return { report_id: String(values[0]) };
-          return null;
-        }),
-        run: vi.fn(async () => ({ success: true })),
-      })),
-    })),
+    prepare: vi.fn(prepare),
     batch: vi.fn(async (statements: D1PreparedStatement[]) => {
-      if (options.diagnosticPersistenceFailure) throw new Error("private D1 failure detail");
-      return statements.map(() => ({ success: true }));
+      if (options.diagnosticPersistenceFailure && statements.some(statement =>
+        (statement as unknown as { sql: string }).sql.includes("provider_ai_failures"))) {
+        throw new Error("private D1 failure detail");
+      }
+      return real.batch(statements);
     }),
   } as unknown as D1Database;
 }
@@ -221,7 +219,7 @@ describe("service landing page", () => {
     expect(html).not.toContain("<script");
     expect(html).not.toContain("<form");
     expect(html).not.toContain("RATE_LIMIT_HASH_PEPPER");
-    expect(html).not.toContain("example-sensitive-account-id");
+    expect(html).not.toContain("555660e547341e8a1afe9934bedc2f7f");
     expect(html).not.toContain("flux-schnell");
     expect(html).not.toContain("not_found");
   });
@@ -345,6 +343,9 @@ describe("model catalog", () => {
       installationDailyCapsEnforced: true,
       artworkSlotDailyAttemptLimit: 1,
       artworkSlotIdSupported: true,
+      generationCancellationSupported: true,
+      outcomeAccountingSupported: true,
+      freeFailureNeuronLimit: 500,
       legacyMissingArtworkSlotScope: "installation_asset_kind",
       resets: "utc_day",
     });
@@ -942,7 +943,7 @@ describe("POST /v1/generate", () => {
     expect(serializedLogs).not.toContain(prompt);
     expect(serializedLogs).not.toContain(INSTALLATION_ID);
     expect(serializedLogs).not.toContain("@cf/black-forest-labs/flux-1-schnell");
-    expect(db.batch).toHaveBeenCalledOnce();
+    expect(db.batch).toHaveBeenCalledTimes(2); // diagnostic attempt plus independent quota settlement
     consoleError.mockRestore();
   });
 
