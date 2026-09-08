@@ -12,7 +12,7 @@ For people checking the service in a browser, `GET` or `HEAD` requests to `/mode
 permanently redirect to the canonical versioned catalog at `/v1/models`. Other unknown paths remain
 structured JSON `404` responses.
 
-Milestone icons use `milestone_icon`: Klein advertises a 512 × 512 output and 27 estimated image
+Milestone icons use `milestone_icon`: Klein advertises a 512 Ã— 512 output and 27 estimated image
 neurons. Use a stable artwork slot for each individual milestone icon, separate from its banner.
 Older servers may not advertise this kind; clients should keep upload available.
 
