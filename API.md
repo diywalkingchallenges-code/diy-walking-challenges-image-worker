@@ -12,6 +12,10 @@ For people checking the service in a browser, `GET` or `HEAD` requests to `/mode
 permanently redirect to the canonical versioned catalog at `/v1/models`. Other unknown paths remain
 structured JSON `404` responses.
 
+Milestone icons use `milestone_icon`: Klein advertises a 512 × 512 output and 27 estimated image
+neurons. Use a stable artwork slot for each individual milestone icon, separate from its banner.
+Older servers may not advertise this kind; clients should keep upload available.
+
 ## `GET /v1/models`
 
 No installation identifier is needed. Clients use this response to discover both the enabled models
@@ -158,7 +162,7 @@ for one route's map, one route's completion medal, or one specific milestone ban
 title, prompt, account identifier, or other user content in this field. The Worker binds the slot to
 the installation and artwork kind, then secret-hashes it before D1 storage.
 
-`assetKind` accepts `medal`, `milestone_banner`, or `route_map`. It is optional and defaults to
+`assetKind` accepts `medal`, `milestone_banner`, `route_map`, `racer_icon`, or `milestone_icon`. It is optional and defaults to
 `medal`, preserving the original request contract. New clients should omit it for medals so medal
 generation also works with older self-hosted Workers. They should send another kind only after the
 catalog advertises it for the selected model.

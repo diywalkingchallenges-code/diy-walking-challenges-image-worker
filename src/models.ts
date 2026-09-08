@@ -94,6 +94,7 @@ const SCHNELL_ASSETS: readonly ModelAssetSpec[] = [
 
 const KLEIN_ASSETS: readonly ModelAssetSpec[] = [
   controlledAsset("racer_icon", OUTPUT_EDGE, OUTPUT_EDGE, KLEIN_NEURONS_PER_OUTPUT_TILE),
+  controlledAsset("milestone_icon", OUTPUT_EDGE, OUTPUT_EDGE, KLEIN_NEURONS_PER_OUTPUT_TILE),
   controlledAsset("medal", OUTPUT_EDGE, OUTPUT_EDGE, KLEIN_NEURONS_PER_OUTPUT_TILE),
   controlledAsset(
     "milestone_banner",

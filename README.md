@@ -1,5 +1,10 @@
 # DIY Walking Challenges Image Worker
 
+Milestone icons (Android 2.17.66): Klein now advertises `milestone_icon` with 512 × 512 output,
+27 estimated image neurons, and a prompt designed for small circular map markers. Icon and banner
+allowances remain separate for each milestone. Apply migration 0006 before deployment; it retains
+existing quotas and diagnostics. Type checks and all 98 server tests pass.
+
 Racer icons (Android 2.17.59): the Klein model advertises `racer_icon` with a square 512 Ã— 512
 output and an icon-specific prompt. The app crops and compresses the selection for map/race use.
 The normal installation and per-artwork quotas, canceled/failed-image accounting, and report flow
