@@ -1,7 +1,7 @@
 export const MAX_USER_PROMPT_CODE_POINTS = 50;
 export const MIN_USER_PROMPT_CODE_POINTS = 3;
 
-export const ASSET_KINDS = ["medal", "milestone_banner", "route_map", "racer_icon"] as const;
+export const ASSET_KINDS = ["medal", "milestone_banner", "route_map", "racer_icon", "milestone_icon"] as const;
 export type AssetKind = (typeof ASSET_KINDS)[number];
 export const DEFAULT_ASSET_KIND: AssetKind = "medal";
 
@@ -71,6 +71,9 @@ export function buildAssetPrompt(assetKind: AssetKind, userPrompt: string): stri
       return buildMedalPrompt(userPrompt);
     case "milestone_banner":
       return buildMilestoneBannerPrompt(userPrompt);
+    case "milestone_icon":
+      return `Create an original square milestone map icon showing: ${userPrompt}.
+Use one bold recognizable landmark or object centered inside a circular safe area. Simple shapes, strong contrast, minimal background, and no small details. This image will be displayed as a tiny circular map marker. Keep the complete subject inside the central 75 percent. No text, lettering, logos, frames, medals, ribbon, watermarks, or copyrighted characters.`;
     case "racer_icon":
       return `Create an original square personal racer avatar showing: ${userPrompt}.
 Use one bold, recognizable subject centered inside a generous circular safe area. Simple shapes, strong contrast, minimal background, and no small details. This image will be displayed as a tiny circular map marker. Keep the complete face or subject inside the central 75 percent. No text, lettering, logos, frames, medals, ribbon, watermarks, or copyrighted characters.`;
